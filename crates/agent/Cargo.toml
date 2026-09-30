@@ -1,0 +1,44 @@
+[package]
+name = "homeguard-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "homeguard_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "homeguard-agent"
+path = "src/main.rs"
+
+[dependencies]
+homeguard-common = { path = "../common" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+jiff.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-pemfile.workspace = true
+tokio.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+reqwest.workspace = true
+clap.workspace = true
+mdns-sd.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+pem.workspace = true
+sha2.workspace = true
+gethostname = "0.5"
+self-replace.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+winreg = "0.52"
+
+[dev-dependencies]
+tempfile = "3"

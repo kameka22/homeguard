@@ -1,0 +1,27 @@
+[package]
+name = "homeguard-app-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+homeguard-common = { path = "../common" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+jiff.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+reqwest.workspace = true
+mdns-sd.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
+rand.workspace = true
+age.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>HomeGuard doit accéder au réseau local pour découvrir les postes équipés de l'agent et leur envoyer les listes de sites à bloquer.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_homeguard._tcp</string>
+	</array>
+</dict>
+</plist>

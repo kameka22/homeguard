@@ -1,0 +1,40 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "HomeGuard",
+  "version": "0.1.0",
+  "identifier": "com.homeguard.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "HomeGuard",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 900,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "resources": {
+      "resources/agents/homeguard-agent-linux-x86_64": "agents/homeguard-agent-linux-x86_64",
+      "resources/agents/homeguard-agent-linux-aarch64": "agents/homeguard-agent-linux-aarch64",
+      "resources/agents/homeguard-agent-windows-x86_64.exe": "agents/homeguard-agent-windows-x86_64.exe",
+      "resources/agents/version.txt": "agents/version.txt"
+    },
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    }
+  }
+}

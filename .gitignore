@@ -1,0 +1,33 @@
+# Rust build artifacts
+/target
+/app/src-tauri/target/
+
+# Tauri-generated capability/ACL schemas (regenerated on every build, used
+# for editor autocompletion only)
+/app/src-tauri/gen/
+
+# Cross-compiled agent binaries — rebuilt locally via scripts/build-agents.sh,
+# not checked in (they're large and platform-specific; see that script's
+# header for the toolchain it needs).
+/app/src-tauri/resources/agents/
+
+# Frontend
+/app/node_modules/
+/app/dist/
+
+# Local environment / secrets — none checked in today, but never start one
+.env
+.env.local
+*.pem
+*.key
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+._*
+Thumbs.db
