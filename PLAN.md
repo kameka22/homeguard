@@ -490,3 +490,11 @@ Légende : ✅ fait et testé (Linux, ce sandbox) · 🟡 fait mais non vérifia
 - Firefox en snap (Ubuntu) : chemin de politiques différent, à valider sur les distributions cibles.
 - Le fichier hosts ne supporte pas les jokers (`*.domaine`). Les variantes connues passent par le catalogue d'alias, les autres sous-domaines ne sont pas couverts.
 - **Traduction de l'UI** : l'interface (Svelte) est actuellement 100 % française, alors que le README et les commentaires de code sont en anglais depuis la publication du dépôt. À terme, prévoir une couche i18n (chaînes externalisées, sélection de langue) pour au moins l'anglais — pas commencé.
+- **App multiplateforme (macOS/Windows/Linux) + agent macOS** : à terme, l'app de pilotage ne doit plus être macOS uniquement, et l'agent doit pouvoir tourner sur macOS aussi (pour superviser un Mac comme poste, pas seulement comme pilote). Pas commencé. Ce qui existe déjà et facilite le travail :
+  - `app-core` (SQLite, moteur de politique, client mTLS, découverte mDNS, serveurs HTTP) est du Rust pur, déjà indépendant de la plateforme.
+  - `ca_store::FileCaStore` existe déjà comme repli non-macOS pour le stockage de la CA (actuellement utilisé par les tests et par tout build non-macOS de l'app) — il faudrait l'exposer comme option réelle côté `app/src-tauri` pour Windows/Linux, en plus ou à la place du Trousseau.
+  Ce qui reste à écrire :
+  - Équivalent du Trousseau macOS pour Windows (DPAPI) et Linux (Secret Service / `FileCaStore` assumé).
+  - Permissions réseau local équivalentes à `Info.plist` sur Windows/Linux (pas de blocage connu, à vérifier).
+  - Côté agent : un module `browser_policy` macOS (actuellement seulement Linux/Windows), un module `service` macOS (`launchd`, actuellement seulement systemd/Windows SCM — le repli générique renvoie une erreur "non supporté"), et une convention de chemins macOS dans `AgentPaths::default_for_os` (actuellement seulement un cas Windows et un cas générique non-Windows).
+  - Cible de compilation croisée macOS dans `scripts/build-agents.sh` (aujourd'hui limité à Linux x86_64/arm64 et Windows x86_64).

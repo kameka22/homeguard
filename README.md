@@ -80,7 +80,7 @@ homeguard/
 │   ├── common/      # shared models: policy, hosts parsing, PKI, wire types
 │   ├── agent/       # agent binary (run / enroll / install / uninstall), Windows/Linux service
 │   └── app-core/    # app-side logic: SQLite, policy engine, mTLS client, mDNS, HTTP servers
-├── app/             # Tauri application (macOS only)
+├── app/             # Tauri application (macOS only today, see Project status)
 │   ├── src/         # Svelte frontend
 │   └── src-tauri/   # Rust backend, commands exposed to the UI
 ├── scripts/         # build-agents.sh, install.sh, install.ps1
@@ -89,7 +89,9 @@ homeguard/
 
 ## Requirements
 
-- **macOS** (the controlling app is macOS-only)
+- **macOS** (the controlling app is macOS-only today — Windows/Linux support
+  for the app, and a macOS build of the agent, are planned; see
+  [PLAN.md](./PLAN.md))
 - [Rust](https://rustup.rs/) (edition 2021, stable toolchain)
 - [Node.js](https://nodejs.org/) + npm
 - To cross-compile the Windows/Linux agent binaries from the Mac:
@@ -166,6 +168,7 @@ but hasn't been validated on real Windows hardware yet.
 | Encrypted export / import | ✅ tested |
 | macOS code signing and notarization | ⬜ not started |
 | UI translation (English) | ⬜ not started — UI is French-only today |
+| Cross-platform app (Windows/Linux) + macOS agent | ⬜ not started — `app-core` is already platform-agnostic Rust; the macOS-specific bits (Keychain storage, service management, browser policy) still need Windows/Linux/macOS counterparts respectively |
 
 Full section-by-section detail: [PLAN.md](./PLAN.md).
 
