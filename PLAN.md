@@ -489,3 +489,4 @@ Légende : ✅ fait et testé (Linux, ce sandbox) · 🟡 fait mais non vérifia
 - Fuseau unique pour tout le parc ou réglable par poste ? Par défaut, fuseau global avec surcharge possible par poste.
 - Firefox en snap (Ubuntu) : chemin de politiques différent, à valider sur les distributions cibles.
 - Le fichier hosts ne supporte pas les jokers (`*.domaine`). Les variantes connues passent par le catalogue d'alias, les autres sous-domaines ne sont pas couverts.
+- **Traduction de l'UI** : l'interface (Svelte) est actuellement 100 % française, alors que le README et les commentaires de code sont en anglais depuis la publication du dépôt. À terme, prévoir une couche i18n (chaînes externalisées, sélection de langue) pour au moins l'anglais — pas commencé.
