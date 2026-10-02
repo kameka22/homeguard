@@ -191,7 +191,7 @@ pub async fn sync_agent(state: State<'_, AppState>, agent_id: String, addr: Stri
     let version = state.db.bump_policy_version(&agent_id).map_err(err)?;
     // TODO: protection flags (self-heal / anti-DoH) should become a
     // per-agent or per-group setting; both default on for now.
-    let policy = resolve_policy_for_agent(&state.db, &agent_id, version, &timezone, true, true).map_err(err)?;
+    let policy = resolve_policy_for_agent(&state.db, &agent_id, version, &timezone, true, true, state.auto_www()).map_err(err)?;
 
     client
         .push_policy(&policy, Some(current_status.applied_policy_version))
@@ -258,6 +258,52 @@ async fn probe_agent(state: &AppState, agent: &Agent) -> bool {
         return false;
     };
     client.status().await.is_ok()
+}
+
+/// Falls back to this when mDNS doesn't surface a poste that *did* enroll
+/// successfully (enrollment already recorded its IP from the TCP peer
+/// address — this never creates a new agent, it only confirms one the app
+/// already knows is reachable at `ip`, for the enrollment dialog's
+/// "detected" list). Tries every known, non-revoked poste's stable name
+/// against `ip` in turn — exactly the same trust check `connect_to_agent`
+/// always does, just without mDNS telling us which one to try first.
+#[tauri::command]
+pub async fn probe_agent_by_ip(state: State<'_, AppState>, ip: String) -> CmdResult<DiscoveredAgent> {
+    let addr: SocketAddr = format!("{ip}:7878").parse().map_err(err)?;
+    let agents = state.db.list_agents().map_err(err)?;
+
+    for agent in agents {
+        if agent.revoked {
+            continue;
+        }
+        let Ok(client) = connect_to_agent(
+            &state.db,
+            &agent.id,
+            addr,
+            &state.client_identity.cert_pem,
+            &state.client_identity.key_pem,
+            state.ca.cert_der(),
+        ) else {
+            continue;
+        };
+        if let Ok(info) = client.info().await {
+            state
+                .db
+                .upsert_agent(&agent.id, &info.hostname, &info.os, &info.arch, Some(&ip), Some(&info.agent_version))
+                .map_err(err)?;
+            return Ok(DiscoveredAgent {
+                agent_id: info.agent_id,
+                hostname: info.hostname,
+                os: info.os,
+                arch: info.arch,
+                agent_version: info.agent_version,
+                ca_fingerprint_sha256: state.ca.fingerprint_sha256(),
+                addr,
+            });
+        }
+    }
+
+    Err("aucun poste connu ne répond à cette adresse".to_string())
 }
 
 /// The agent's own service manager restarts it `RestartSec=5` after it
@@ -520,6 +566,21 @@ pub fn assignments_for(state: State<'_, AppState>, agent_id: String) -> CmdResul
     state.db.assignments_for(&agent_id, &group_ids).map_err(err)
 }
 
+/// Every assignment, regardless of target — the group/list detail screens
+/// filter client-side by `target_kind`/`target_id` rather than needing a
+/// dedicated query each. Already written for export; just unexposed until
+/// the per-entity detail screens needed it too.
+#[tauri::command]
+pub fn list_assignments(state: State<'_, AppState>) -> CmdResult<Vec<Assignment>> {
+    state.db.list_assignments().map_err(err)
+}
+
+/// Same as `list_assignments`, for exceptions (temporary unblocks).
+#[tauri::command]
+pub fn list_exceptions(state: State<'_, AppState>) -> CmdResult<Vec<Exception>> {
+    state.db.list_exceptions().map_err(err)
+}
+
 #[tauri::command]
 pub fn create_assignment(
     state: State<'_, AppState>,
@@ -538,6 +599,15 @@ pub fn create_assignment(
 #[tauri::command]
 pub fn delete_assignment(state: State<'_, AppState>, assignment_id: String) -> CmdResult<()> {
     state.db.delete_assignment(&assignment_id).map_err(err)
+}
+
+#[tauri::command]
+pub fn update_assignment_schedule(
+    state: State<'_, AppState>,
+    assignment_id: String,
+    schedule: Option<Vec<TimeWindow>>,
+) -> CmdResult<()> {
+    state.db.update_assignment_schedule(&assignment_id, schedule.as_deref()).map_err(err)
 }
 
 #[tauri::command]
@@ -593,6 +663,25 @@ pub struct UpcomingTransition {
     pub becomes_blocked: bool,
 }
 
+/// Display label for an assignment's target: an agent's name, or "groupe
+/// <Nom>" — shared by every fleet-wide dashboard query that resolves
+/// assignments without going through a single poste's own
+/// `assignments_for`.
+fn resolve_target_label(assignment: &Assignment, agents: &[Agent], groups: &[Group]) -> String {
+    match assignment.target_kind {
+        TargetKind::Agent => agents
+            .iter()
+            .find(|a| a.id == assignment.target_id)
+            .map(|a| a.display_name.clone().unwrap_or_else(|| a.hostname.clone()))
+            .unwrap_or_else(|| assignment.target_id.clone()),
+        TargetKind::Group => groups
+            .iter()
+            .find(|g| g.id == assignment.target_id)
+            .map(|g| format!("groupe {}", g.name))
+            .unwrap_or_else(|| assignment.target_id.clone()),
+    }
+}
+
 /// Every upcoming schedule transition across the whole fleet — assignments
 /// with no schedule ("toujours") don't produce any, since they never
 /// change. Used by the dashboard's "Prochaines transitions" panel.
@@ -616,18 +705,7 @@ pub fn upcoming_transitions(state: State<'_, AppState>, limit: usize) -> CmdResu
             .find(|l| l.id == assignment.list_id)
             .map(|l| l.name.clone())
             .unwrap_or_else(|| assignment.list_id.clone());
-        let target_label = match assignment.target_kind {
-            TargetKind::Agent => agents
-                .iter()
-                .find(|a| a.id == assignment.target_id)
-                .map(|a| a.display_name.clone().unwrap_or_else(|| a.hostname.clone()))
-                .unwrap_or_else(|| assignment.target_id.clone()),
-            TargetKind::Group => groups
-                .iter()
-                .find(|g| g.id == assignment.target_id)
-                .map(|g| format!("groupe {}", g.name))
-                .unwrap_or_else(|| assignment.target_id.clone()),
-        };
+        let target_label = resolve_target_label(assignment, &agents, &groups);
 
         for window in schedule {
             if let Some(next) = window.next_transition(&now) {
@@ -644,6 +722,93 @@ pub fn upcoming_transitions(state: State<'_, AppState>, limit: usize) -> CmdResu
     results.sort_by(|a, b| a.at.cmp(&b.at));
     results.truncate(limit);
     Ok(results)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineSegment {
+    /// RFC 3339.
+    pub from: String,
+    /// RFC 3339.
+    pub to: String,
+    pub blocked: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TimelineRow {
+    pub list_name: String,
+    pub target_label: String,
+    pub segments: Vec<TimelineSegment>,
+}
+
+/// Blocked/open segments for every assignment over the next `hours` hours —
+/// what the dashboard's timeline chart draws. Unlike `upcoming_transitions`
+/// (which only ever reports each window's *next* flip, however far off),
+/// this walks every window forward step by step through the whole
+/// requested span, so the chart has no gaps even when a rule flips more
+/// than once in that window.
+#[tauri::command]
+pub fn fleet_timeline(state: State<'_, AppState>, hours: i64) -> CmdResult<Vec<TimelineRow>> {
+    let timezone = state.timezone();
+    let now_ts = jiff::Timestamp::now();
+    let end_ts = now_ts + jiff::SignedDuration::from_secs(hours * 3600);
+    let now = now_ts.in_tz(&timezone).map_err(err)?;
+
+    let assignments = state.db.list_assignments().map_err(err)?;
+    let lists = state.db.list_lists().map_err(err)?;
+    let groups = state.db.list_groups().map_err(err)?;
+    let agents = state.db.list_agents().map_err(err)?;
+
+    let mut rows = Vec::with_capacity(assignments.len());
+    for assignment in &assignments {
+        let list_name = lists
+            .iter()
+            .find(|l| l.id == assignment.list_id)
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| assignment.list_id.clone());
+        let target_label = resolve_target_label(&assignment, &agents, &groups);
+
+        let segments = match &assignment.schedule {
+            None => vec![TimelineSegment {
+                from: now_ts.to_string(),
+                to: end_ts.to_string(),
+                blocked: true,
+            }],
+            Some(windows) => {
+                let mut segments = Vec::new();
+                let mut cursor = now.clone();
+                let mut blocked = windows.iter().any(|w| w.contains(&cursor));
+                // Each step jumps to the earliest of every window's next
+                // flip — bounded well above anything a realistic schedule
+                // and `hours` span could produce, just as a backstop
+                // against an unforeseen non-terminating case.
+                for _ in 0..500 {
+                    let next = windows.iter().filter_map(|w| w.next_transition(&cursor)).min_by_key(|z| z.timestamp());
+                    match next {
+                        Some(t) if t.timestamp() < end_ts => {
+                            segments.push(TimelineSegment {
+                                from: cursor.timestamp().to_string(),
+                                to: t.timestamp().to_string(),
+                                blocked,
+                            });
+                            cursor = t;
+                            blocked = windows.iter().any(|w| w.contains(&cursor));
+                        }
+                        _ => break,
+                    }
+                }
+                segments.push(TimelineSegment {
+                    from: cursor.timestamp().to_string(),
+                    to: end_ts.to_string(),
+                    blocked,
+                });
+                segments
+            }
+        };
+
+        rows.push(TimelineRow { list_name, target_label, segments });
+    }
+
+    Ok(rows)
 }
 
 // --- enrollment --------------------------------------------------------
@@ -847,6 +1012,23 @@ pub fn ca_fingerprint(state: State<'_, AppState>) -> String {
     state.ca.fingerprint_sha256()
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CaDetails {
+    pub fingerprint: String,
+    pub algorithm: String,
+    /// RFC 3339.
+    pub not_after: String,
+}
+
+#[tauri::command]
+pub fn ca_details(state: State<'_, AppState>) -> CaDetails {
+    CaDetails {
+        fingerprint: state.ca.fingerprint_sha256(),
+        algorithm: state.ca.algorithm_name().to_string(),
+        not_after: state.ca.not_after_rfc3339(),
+    }
+}
+
 #[tauri::command]
 pub fn get_timezone(state: State<'_, AppState>) -> String {
     state.timezone()
@@ -855,6 +1037,113 @@ pub fn get_timezone(state: State<'_, AppState>) -> String {
 #[tauri::command]
 pub fn set_timezone(state: State<'_, AppState>, timezone: String) -> CmdResult<()> {
     state.db.set_setting("timezone", &timezone).map_err(err)
+}
+
+/// "system" (follow macOS), "light", or "dark" — defaults to "system".
+#[tauri::command]
+pub fn get_theme(state: State<'_, AppState>) -> CmdResult<String> {
+    Ok(state.db.get_setting("theme").map_err(err)?.unwrap_or_else(|| "system".to_string()))
+}
+
+#[tauri::command]
+pub fn set_theme(state: State<'_, AppState>, theme: String) -> CmdResult<()> {
+    state.db.set_setting("theme", &theme).map_err(err)
+}
+
+/// Whether the first-launch welcome screen has already been dismissed —
+/// distinct from "there's no poste yet", which can stay true indefinitely
+/// (a poste was added then removed) without the welcome screen coming back.
+#[tauri::command]
+pub fn get_onboarding_done(state: State<'_, AppState>) -> CmdResult<bool> {
+    Ok(state.db.get_setting("onboarding_done").map_err(err)? == Some("true".to_string()))
+}
+
+#[tauri::command]
+pub fn set_onboarding_done(state: State<'_, AppState>) -> CmdResult<()> {
+    state.db.set_setting("onboarding_done", "true").map_err(err)
+}
+
+/// Whether opening the app should immediately scan the LAN and sync every
+/// poste it finds, instead of just loading what's already known. Defaults
+/// on — this is what a household admin opening the app almost always
+/// wants to see first.
+#[tauri::command]
+pub fn get_scan_on_launch(state: State<'_, AppState>) -> CmdResult<bool> {
+    Ok(state.db.get_setting("scan_on_launch").map_err(err)?.is_none_or(|v| v == "true"))
+}
+
+#[tauri::command]
+pub fn set_scan_on_launch(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
+    state.db.set_setting("scan_on_launch", if enabled { "true" } else { "false" }).map_err(err)
+}
+
+/// Whether an outdated poste found during a scan should be updated right
+/// away, with no confirmation. Off by default: pushing a new agent binary
+/// unattended is the kind of thing an admin should opt into, not discover
+/// after the fact.
+#[tauri::command]
+pub fn get_auto_update_agents(state: State<'_, AppState>) -> CmdResult<bool> {
+    Ok(state.db.get_setting("auto_update_agents").map_err(err)? == Some("true".to_string()))
+}
+
+#[tauri::command]
+pub fn set_auto_update_agents(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
+    state.db.set_setting("auto_update_agents", if enabled { "true" } else { "false" }).map_err(err)
+}
+
+/// Minutes a fresh "Débloquer…" dialog proposes by default — the admin can
+/// always pick a different duration for that one unblock.
+#[tauri::command]
+pub fn get_default_unblock_minutes(state: State<'_, AppState>) -> CmdResult<u32> {
+    Ok(state
+        .db
+        .get_setting("default_unblock_minutes")
+        .map_err(err)?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60))
+}
+
+#[tauri::command]
+pub fn set_default_unblock_minutes(state: State<'_, AppState>, minutes: u32) -> CmdResult<()> {
+    state.db.set_setting("default_unblock_minutes", &minutes.to_string()).map_err(err)
+}
+
+/// Whether `www.<domaine>` is added automatically next to every domain a
+/// list blocks — on by default (see [`crate::state::AppState::auto_www`]).
+#[tauri::command]
+pub fn get_auto_www(state: State<'_, AppState>) -> CmdResult<bool> {
+    Ok(state.auto_www())
+}
+
+#[tauri::command]
+pub fn set_auto_www(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
+    state.db.set_setting("auto_www", if enabled { "true" } else { "false" }).map_err(err)
+}
+
+// --- domain alias catalog ----------------------------------------------
+
+#[tauri::command]
+pub fn list_aliases(state: State<'_, AppState>) -> CmdResult<Vec<homeguard_common::AliasEntry>> {
+    state.db.list_aliases().map_err(err)
+}
+
+#[tauri::command]
+pub fn upsert_alias(state: State<'_, AppState>, base_domain: String, variants: Vec<String>) -> CmdResult<()> {
+    state.db.upsert_alias(&base_domain, &variants).map_err(err)
+}
+
+#[tauri::command]
+pub fn delete_alias(state: State<'_, AppState>, base_domain: String) -> CmdResult<()> {
+    state.db.delete_alias(&base_domain).map_err(err)
+}
+
+/// Plain-text file write, no encryption — for exports that aren't the
+/// sensitive CA/credential bundle `export_config` is (e.g. a CSV of the
+/// history log), where asking for a passphrase would be friction with no
+/// real benefit.
+#[tauri::command]
+pub fn write_text_file(path: String, contents: String) -> CmdResult<()> {
+    std::fs::write(&path, contents).map_err(err)
 }
 
 // --- export / import --------------------------------------------------

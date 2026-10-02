@@ -10,7 +10,7 @@
 use age::secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use homeguard_common::policy::TimeWindow;
-use homeguard_common::Ca;
+use homeguard_common::{AliasEntry, Ca};
 
 use crate::db::{Agent, Assignment, Db, DbError, Exception, Group, List};
 
@@ -44,6 +44,11 @@ pub struct ExportedConfig {
     pub assignments: Vec<Assignment>,
     pub exceptions: Vec<Exception>,
     pub settings: Vec<(String, String)>,
+    /// Absent in a v1 backup written before the alias catalog became
+    /// editable — `apply_import` then just leaves whatever's already
+    /// seeded in the target DB alone.
+    #[serde(default)]
+    pub aliases: Vec<AliasEntry>,
 }
 
 pub fn build_export(db: &Db, ca: &Ca) -> Result<ExportedConfig, ExportError> {
@@ -58,6 +63,7 @@ pub fn build_export(db: &Db, ca: &Ca) -> Result<ExportedConfig, ExportError> {
         assignments: db.list_assignments()?,
         exceptions: db.list_exceptions()?,
         settings: db.list_settings()?,
+        aliases: db.list_aliases()?,
     })
 }
 
@@ -140,6 +146,10 @@ pub fn apply_import(db: &Db, config: &ExportedConfig) -> Result<(), ExportError>
 
     for (key, value) in &config.settings {
         db.set_setting(key, value)?;
+    }
+
+    for alias in &config.aliases {
+        db.upsert_alias(&alias.base_domain, &alias.variants)?;
     }
 
     Ok(())

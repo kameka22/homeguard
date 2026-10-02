@@ -57,6 +57,13 @@ impl AppState {
             .flatten()
             .unwrap_or_else(|| DEFAULT_TIMEZONE.to_string())
     }
+
+    /// Whether `www.<domaine>` should be added automatically alongside
+    /// every domain pushed to a poste — on by default (matches the
+    /// behavior before this was a setting).
+    pub fn auto_www(&self) -> bool {
+        self.db.get_setting("auto_www").ok().flatten().is_none_or(|v| v == "true")
+    }
 }
 
 /// The CA is the app's most sensitive secret (it can mint a certificate

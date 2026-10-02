@@ -3,11 +3,9 @@
 //! agent. The agent never needs to know what a "group" or a "list" is.
 
 use homeguard_common::policy::{Exception as PolicyException, Policy, Protection, Rule};
-use homeguard_common::{default_catalog, expand_domains};
+use homeguard_common::expand_domains;
 
 use crate::db::{Db, DbError};
-
-const INCLUDE_WWW: bool = true;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyEngineError {
@@ -16,7 +14,9 @@ pub enum PolicyEngineError {
 }
 
 /// Build the policy `agent_id` should be running, at the version the
-/// caller assigns (see [`Db::bump_policy_version`]).
+/// caller assigns (see [`Db::bump_policy_version`]). `auto_www` controls
+/// whether `www.<domain>` is added automatically alongside each domain
+/// (on top of whatever variants the alias catalog itself already lists).
 pub fn resolve_policy_for_agent(
     db: &Db,
     agent_id: &str,
@@ -24,9 +24,10 @@ pub fn resolve_policy_for_agent(
     timezone: &str,
     self_heal: bool,
     disable_doh: bool,
+    auto_www: bool,
 ) -> Result<Policy, PolicyEngineError> {
     let group_ids = db.agent_group_ids(agent_id)?;
-    let catalog = default_catalog();
+    let catalog = db.list_aliases()?;
 
     let assignments = db.assignments_for(agent_id, &group_ids)?;
     let mut rules = Vec::with_capacity(assignments.len());
@@ -37,7 +38,7 @@ pub fn resolve_policy_for_agent(
         rules.push(Rule {
             id: assignment.id,
             name: list.name,
-            domains: expand_domains(&list.domains, &catalog, INCLUDE_WWW),
+            domains: expand_domains(&list.domains, &catalog, auto_www),
             schedule: assignment.schedule,
         });
     }
@@ -69,9 +70,10 @@ pub fn resolve_initial_policy_for_agent(
     timezone: &str,
     self_heal: bool,
     disable_doh: bool,
+    auto_www: bool,
 ) -> Result<Policy, PolicyEngineError> {
     let version = db.bump_policy_version(agent_id)?;
-    resolve_policy_for_agent(db, agent_id, version, timezone, self_heal, disable_doh)
+    resolve_policy_for_agent(db, agent_id, version, timezone, self_heal, disable_doh, auto_www)
 }
 
 pub fn target_agent_and_groups(db: &Db, agent_id: &str) -> Result<(String, Vec<String>), PolicyEngineError> {
@@ -99,7 +101,7 @@ mod tests {
         db.create_assignment(&games, TargetKind::Group, &group_id, Some(&[window]))
             .unwrap();
 
-        let policy = resolve_policy_for_agent(&db, "a1", 1, "Europe/Paris", true, true).unwrap();
+        let policy = resolve_policy_for_agent(&db, "a1", 1, "Europe/Paris", true, true, true).unwrap();
         assert_eq!(policy.rules.len(), 1);
         assert_eq!(policy.rules[0].domains, vec!["roblox.com".to_string(), "www.roblox.com".to_string()]);
         assert!(policy.rules[0].schedule.is_some());
@@ -122,7 +124,7 @@ mod tests {
         let until = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(1800);
         db.create_exception(TargetKind::Agent, "a1", &["twitch.tv".to_string()], until).unwrap();
 
-        let policy = resolve_policy_for_agent(&db, "a1", 1, "Europe/Paris", false, false).unwrap();
+        let policy = resolve_policy_for_agent(&db, "a1", 1, "Europe/Paris", false, false, true).unwrap();
         assert_eq!(policy.rules.len(), 2);
         assert_eq!(policy.exceptions.len(), 1);
 
@@ -136,9 +138,9 @@ mod tests {
     fn resolve_initial_policy_bumps_version() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_agent("a1", "PORTABLE-LEO", "windows", "x86_64", None, None).unwrap();
-        let policy = resolve_initial_policy_for_agent(&db, "a1", "UTC", true, false).unwrap();
+        let policy = resolve_initial_policy_for_agent(&db, "a1", "UTC", true, false, true).unwrap();
         assert_eq!(policy.version, 1);
-        let policy2 = resolve_initial_policy_for_agent(&db, "a1", "UTC", true, false).unwrap();
+        let policy2 = resolve_initial_policy_for_agent(&db, "a1", "UTC", true, false, true).unwrap();
         assert_eq!(policy2.version, 2);
     }
 }

@@ -31,3 +31,7 @@
 .DS_Store
 ._*
 Thumbs.db
+
+# Local design review mockups (not part of the shipped app)
+/design-proposal.html
+/HomeGuard — Refonte macOS.pdf

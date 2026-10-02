@@ -5,6 +5,7 @@
 
 use std::sync::Mutex;
 
+use homeguard_common::AliasEntry;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +90,11 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS aliases (
+    base_domain   TEXT PRIMARY KEY,
+    variants_json TEXT NOT NULL
 );
 "#;
 
@@ -200,6 +206,25 @@ fn migrate_add_missing_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// First-run only: loads the built-in catalog into the `aliases` table so
+/// it's editable from the UI from day one — once seeded, the compiled
+/// `default_catalog()` is never consulted again, the table is the single
+/// source of truth. A non-empty table (every later launch) is left alone.
+fn seed_default_aliases(conn: &Connection) -> Result<()> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM aliases", [], |row| row.get(0))?;
+    if count > 0 {
+        return Ok(());
+    }
+    for entry in homeguard_common::default_catalog() {
+        let variants_json = serde_json::to_string(&entry.variants)?;
+        conn.execute(
+            "INSERT INTO aliases (base_domain, variants_json) VALUES (?1, ?2)",
+            params![entry.base_domain, variants_json],
+        )?;
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -214,6 +239,7 @@ impl Db {
         // in explicitly, or every query that mentions them fails with
         // "Invalid column name" against a pre-existing database file.
         migrate_add_missing_columns(&conn)?;
+        seed_default_aliases(&conn)?;
         Ok(Db { conn: Mutex::new(conn) })
     }
 
@@ -221,6 +247,7 @@ impl Db {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        seed_default_aliases(&conn)?;
         Ok(Db { conn: Mutex::new(conn) })
     }
 
@@ -485,6 +512,23 @@ impl Db {
         Ok(())
     }
 
+    /// Replaces just an existing assignment's schedule — what the "Horaire…"
+    /// editor saves, as opposed to [`Db::create_assignment`] (a new
+    /// assignment entirely) or [`Db::upsert_assignment`] (every field, for
+    /// import).
+    pub fn update_assignment_schedule(
+        &self,
+        id: &str,
+        schedule: Option<&[homeguard_common::policy::TimeWindow]>,
+    ) -> Result<()> {
+        let schedule_json = schedule.map(serde_json::to_string).transpose()?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE assignments SET schedule_json = ?1 WHERE id = ?2", params![schedule_json, id])?;
+        Ok(())
+    }
+
     pub fn create_assignment(
         &self,
         list_id: &str,
@@ -690,6 +734,35 @@ impl Db {
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
+
+    // --- domain alias catalog --------------------------------------------
+
+    pub fn list_aliases(&self) -> Result<Vec<AliasEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT base_domain, variants_json FROM aliases ORDER BY base_domain")?;
+        let rows = stmt.query_map([], row_to_alias)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Insert or replace one base domain's variant list — the add form and
+    /// an edit both just call this with the full desired variant set.
+    pub fn upsert_alias(&self, base_domain: &str, variants: &[String]) -> Result<()> {
+        let variants_json = serde_json::to_string(variants)?;
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO aliases (base_domain, variants_json) VALUES (?1, ?2)
+             ON CONFLICT(base_domain) DO UPDATE SET variants_json = excluded.variants_json",
+            params![base_domain, variants_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_alias(&self, base_domain: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM aliases WHERE base_domain = ?1", params![base_domain])?;
+        Ok(())
+    }
 }
 
 fn row_to_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
@@ -716,6 +789,15 @@ fn row_to_list(row: &rusqlite::Row) -> rusqlite::Result<List> {
         id: row.get(0)?,
         name: row.get(1)?,
         domains,
+    })
+}
+
+fn row_to_alias(row: &rusqlite::Row) -> rusqlite::Result<AliasEntry> {
+    let variants_json: String = row.get(1)?;
+    let variants: Vec<String> = serde_json::from_str(&variants_json).unwrap_or_default();
+    Ok(AliasEntry {
+        base_domain: row.get(0)?,
+        variants,
     })
 }
 
@@ -918,6 +1000,29 @@ mod tests {
     }
 
     #[test]
+    fn update_assignment_schedule_replaces_only_the_schedule() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("a1", "PORTABLE-LEO", "windows", "x86_64", None, None).unwrap();
+        let list_id = db.create_list("Jeux", &["roblox.com".into()]).unwrap();
+        let assignment_id = db.create_assignment(&list_id, TargetKind::Agent, "a1", None).unwrap();
+
+        let window = homeguard_common::policy::TimeWindow {
+            days: vec![homeguard_common::Day::Mon, homeguard_common::Day::Tue],
+            from: jiff::civil::time(8, 0, 0, 0),
+            to: jiff::civil::time(18, 0, 0, 0),
+        };
+        db.update_assignment_schedule(&assignment_id, Some(&[window])).unwrap();
+
+        let assignments = db.list_assignments().unwrap();
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].list_id, list_id);
+        assert!(assignments[0].schedule.is_some());
+
+        db.update_assignment_schedule(&assignment_id, None).unwrap();
+        assert!(db.list_assignments().unwrap()[0].schedule.is_none());
+    }
+
+    #[test]
     fn list_assignments_returns_every_assignment_regardless_of_target() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_agent("a1", "PORTABLE-LEO", "windows", "x86_64", None, None).unwrap();
@@ -1015,5 +1120,36 @@ mod tests {
         assert_eq!(history[0].source, "agent");
         assert_eq!(history[0].kind, "integrity_restored");
         assert_eq!(history[0].agent_id.as_deref(), Some("a1"));
+    }
+
+    #[test]
+    fn fresh_db_is_seeded_with_the_builtin_alias_catalog() {
+        let db = Db::open_in_memory().unwrap();
+        let aliases = db.list_aliases().unwrap();
+        assert_eq!(aliases.len(), homeguard_common::default_catalog().len());
+        assert!(aliases.iter().any(|a| a.base_domain == "youtube.com"));
+    }
+
+    #[test]
+    fn alias_catalog_is_editable() {
+        let db = Db::open_in_memory().unwrap();
+
+        db.upsert_alias("example.org", &["www.example.org".to_string()]).unwrap();
+        let aliases = db.list_aliases().unwrap();
+        assert!(aliases.iter().any(|a| a.base_domain == "example.org" && a.variants == vec!["www.example.org"]));
+
+        // Editing a built-in entry replaces its variants rather than adding
+        // a second row for the same base domain.
+        db.upsert_alias("youtube.com", &["kids.youtube.com".to_string()]).unwrap();
+        let aliases = db.list_aliases().unwrap();
+        let youtube = aliases.iter().filter(|a| a.base_domain == "youtube.com").count();
+        assert_eq!(youtube, 1);
+        assert_eq!(
+            aliases.iter().find(|a| a.base_domain == "youtube.com").unwrap().variants,
+            vec!["kids.youtube.com".to_string()]
+        );
+
+        db.delete_alias("example.org").unwrap();
+        assert!(!db.list_aliases().unwrap().iter().any(|a| a.base_domain == "example.org"));
     }
 }

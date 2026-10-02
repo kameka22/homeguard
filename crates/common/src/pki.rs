@@ -53,6 +53,7 @@ pub struct Ca {
     issuer: rcgen::Certificate,
     cert_pem: String,
     cert_der: CertificateDer<'static>,
+    not_after: OffsetDateTime,
 }
 
 impl Ca {
@@ -60,6 +61,10 @@ impl Ca {
     pub fn generate() -> Result<Self, PkiError> {
         let key_pair = KeyPair::generate()?;
         let params = ca_params()?;
+        // X.509 time fields carry no sub-second precision, so this would
+        // otherwise disagree with the value `from_pem` reads back from the
+        // serialized cert (whole seconds only) for the exact same CA.
+        let not_after = params.not_after.replace_nanosecond(0).unwrap_or(params.not_after);
         let issuer = params.self_signed(&key_pair)?;
         let cert_der = issuer.der().clone();
         let cert_pem = issuer.pem();
@@ -68,6 +73,7 @@ impl Ca {
             issuer,
             cert_pem,
             cert_der,
+            not_after,
         })
     }
 
@@ -75,6 +81,7 @@ impl Ca {
     pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, PkiError> {
         let key_pair = KeyPair::from_pem(key_pem)?;
         let params = CertificateParams::from_ca_cert_pem(cert_pem)?;
+        let not_after = params.not_after;
         let cert_der = pem_to_der(cert_pem)?;
         let issuer = params.self_signed(&key_pair)?;
         Ok(Ca {
@@ -82,6 +89,7 @@ impl Ca {
             issuer,
             cert_pem: cert_pem.to_string(),
             cert_der,
+            not_after,
         })
     }
 
@@ -102,6 +110,21 @@ impl Ca {
     /// the enrollment server.
     pub fn fingerprint_sha256(&self) -> String {
         fingerprint_sha256(&self.cert_der)
+    }
+
+    /// RFC 3339 expiry of the CA certificate itself — not a leaf's, which
+    /// are reissued every [`LEAF_VALIDITY_YEARS`] regardless.
+    pub fn not_after_rfc3339(&self) -> String {
+        self.not_after
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default()
+    }
+
+    /// The signature algorithm every key this CA issues (its own included)
+    /// is generated with — always this one, since [`KeyPair::generate`]
+    /// never varies it.
+    pub fn algorithm_name(&self) -> &'static str {
+        "ECDSA P-256"
     }
 
     /// Sign a CSR produced by an agent (see [`generate_agent_identity`]),
@@ -266,6 +289,19 @@ mod tests {
         let reloaded = Ca::from_pem(ca.cert_pem(), &ca.key_pem()).unwrap();
         assert_eq!(ca.cert_pem(), reloaded.cert_pem());
         assert_eq!(ca.fingerprint_sha256(), reloaded.fingerprint_sha256());
+    }
+
+    #[test]
+    fn exposes_algorithm_and_survives_reload_with_the_same_expiry() {
+        let ca = Ca::generate().unwrap();
+        assert_eq!(ca.algorithm_name(), "ECDSA P-256");
+        // CA_VALIDITY_YEARS out, not "now" — a freshly generated CA's
+        // not_after is nowhere near today.
+        let expected_year = (OffsetDateTime::now_utc().year() + CA_VALIDITY_YEARS as i32).to_string();
+        assert!(ca.not_after_rfc3339().starts_with(&expected_year));
+
+        let reloaded = Ca::from_pem(ca.cert_pem(), &ca.key_pem()).unwrap();
+        assert_eq!(ca.not_after_rfc3339(), reloaded.not_after_rfc3339());
     }
 
     #[test]

@@ -34,10 +34,16 @@ pub struct EnrollmentState {
     pub timezone: String,
     pub default_self_heal: bool,
     pub default_disable_doh: bool,
+    pub default_auto_www: bool,
 }
 
 impl EnrollmentState {
     pub fn new(ca: Arc<Ca>, db: Arc<Db>, timezone: impl Into<String>) -> Self {
+        // Read live rather than hardcoded like the two flags above: this
+        // one the admin can actually change from Réglages, and a session
+        // that outlives a toggle flip shouldn't keep enrolling postes
+        // against a stale value.
+        let default_auto_www = db.get_setting("auto_www").ok().flatten().is_none_or(|v| v == "true");
         EnrollmentState {
             ca,
             db,
@@ -45,6 +51,7 @@ impl EnrollmentState {
             timezone: timezone.into(),
             default_self_heal: true,
             default_disable_doh: true,
+            default_auto_www,
         }
     }
 
@@ -129,6 +136,7 @@ async fn enroll_handler(
         &state.timezone,
         state.default_self_heal,
         state.default_disable_doh,
+        state.default_auto_www,
     ) {
         Ok(policy) => policy,
         Err(e) => {

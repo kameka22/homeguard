@@ -58,5 +58,22 @@
   {:else if name === "wifi-off"}
     <path d="M2 8.5c2.4-2 5.2-3.2 8.2-3.5M22 8.5a17.6 17.6 0 0 0-4.9-3.1M6 12.3c1.6-1.2 3.5-1.9 5.5-2M18 12.3a9 9 0 0 0-2.3-1.6M9 16c.9-.6 2-1 3-1s2.1.4 3 1M12 20h.01" />
     <path d="M3 3l18 18" />
+  {:else if name === "wifi"}
+    <path d="M2 8.5c2.9-2.4 6.3-3.5 10-3.5s7.1 1.1 10 3.5M5.5 12.5c2-1.4 4.2-2 6.5-2s4.5.6 6.5 2M9 16.3c1-.5 2-.8 3-.8s2 .3 3 .8M12 20h.01" />
+  {:else if name === "refresh"}
+    <path d="M4 12a8 8 0 0 1 13.7-5.7L20 8.5M20 4v4.5h-4.5" />
+    <path d="M20 12a8 8 0 0 1-13.7 5.7L4 15.5M4 20v-4.5h4.5" />
+  {:else if name === "more"}
+    <circle cx="5" cy="12" r="1.3" fill="currentColor" stroke="none" />
+    <circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none" />
+    <circle cx="19" cy="12" r="1.3" fill="currentColor" stroke="none" />
+  {:else if name === "key"}
+    <circle cx="8" cy="15" r="3.5" />
+    <path d="M10.3 12.6 19 4M16.2 7.3l2.3 2.3M13.4 10.1l1.8 1.8" />
+  {:else if name === "lock-open"}
+    <rect x="5" y="11" width="14" height="9" rx="2" />
+    <path d="M8 11V7a4 4 0 0 1 7.5-2" />
+  {:else if name === "minus"}
+    <path d="M5 12h14" />
   {/if}
 </svg>
