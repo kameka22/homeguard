@@ -1,5 +1,7 @@
 mod app_identity;
 mod commands;
+#[cfg(test)]
+mod e2e_tests;
 #[cfg(target_os = "macos")]
 mod keychain_ca_store;
 mod menu;
