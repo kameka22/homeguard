@@ -15,6 +15,8 @@
 //! `wait_for_shutdown_signal` uses a heuristic instead (see
 //! `is_system_shutting_down`).
 
+use std::path::Path;
+
 use homeguard_common::wire::EventKind;
 
 use crate::events::EventLog;
@@ -99,12 +101,58 @@ fn is_system_shutting_down() -> bool {
         .unwrap_or(false)
 }
 
+/// How long after an installer drops the restart marker its stop still
+/// counts as planned. Long enough for `install.ps1`'s download-free tail
+/// (stop, enroll, install), short enough that a forgotten marker can't
+/// hide a later, genuine manual stop for long — and `run` clears any
+/// leftover at startup anyway.
+const RESTART_MARKER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Called by an installer (`homeguard-agent install`, `install.ps1`)
+/// right before it stops the running service to replace it: that stop is
+/// the re-installation itself, not someone switching protection off, so
+/// it mustn't surface as "arrêt manuel détecté".
+///
+/// This doesn't open a way around the alert: whoever can stop the
+/// service (root / an administrator) can already do far more than hide
+/// one history entry.
+pub fn mark_restart_expected(marker: &Path) -> std::io::Result<()> {
+    std::fs::write(marker, jiff::Timestamp::now().to_string())
+}
+
+/// Removes a leftover marker — `run` calls this at startup, so a marker
+/// written when no service was running (first install) is never picked up
+/// by a later stop.
+pub fn clear_restart_marker(marker: &Path) {
+    let _ = std::fs::remove_file(marker);
+}
+
+/// Consumes the marker, reporting whether it was there and recent. An
+/// unreadable timestamp (clock moved backwards...) counts as stale:
+/// better one false alert than a missed one.
+fn take_restart_marker(marker: &Path) -> bool {
+    let fresh = std::fs::metadata(marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age <= RESTART_MARKER_MAX_AGE);
+    clear_restart_marker(marker);
+    fresh
+}
+
 /// Only a genuine manual stop is worth a history entry — a system
-/// shutdown ends every process the same way and needs no attention.
-pub fn log_shutdown(events: &EventLog, cause: ShutdownCause) {
-    if cause == ShutdownCause::Manual {
-        let _ = events.append(EventKind::ManualStopDetected, "agent arrêté manuellement");
+/// shutdown ends every process the same way and needs no attention, and
+/// neither does an installer replacing the agent (see
+/// [`mark_restart_expected`]).
+pub fn log_shutdown(events: &EventLog, cause: ShutdownCause, restart_marker: &Path) {
+    if cause != ShutdownCause::Manual {
+        return;
     }
+    if take_restart_marker(restart_marker) {
+        tracing::info!("arrêt demandé par une réinstallation — pas d'alerte");
+        return;
+    }
+    let _ = events.append(EventKind::ManualStopDetected, "agent arrêté manuellement");
 }
 
 #[cfg(test)]
@@ -145,7 +193,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let events = EventLog::open(dir.path().join("events.jsonl")).unwrap();
 
-        log_shutdown(&events, ShutdownCause::Manual);
+        log_shutdown(&events, ShutdownCause::Manual, &dir.path().join("restart-expected"));
 
         let (entries, _) = events.since(1).unwrap();
         assert_eq!(entries.len(), 1);
@@ -157,9 +205,45 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let events = EventLog::open(dir.path().join("events.jsonl")).unwrap();
 
-        log_shutdown(&events, ShutdownCause::SystemShutdown);
+        log_shutdown(&events, ShutdownCause::SystemShutdown, &dir.path().join("restart-expected"));
 
         let (entries, _) = events.since(1).unwrap();
         assert!(entries.is_empty(), "a routine power-off shouldn't need an admin's attention");
+    }
+
+    #[test]
+    fn a_stop_announced_by_an_installer_is_not_an_alert() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = EventLog::open(dir.path().join("events.jsonl")).unwrap();
+        let marker = dir.path().join("restart-expected");
+
+        mark_restart_expected(&marker).unwrap();
+        log_shutdown(&events, ShutdownCause::Manual, &marker);
+
+        let (entries, _) = events.since(1).unwrap();
+        assert!(entries.is_empty(), "a re-install must not read as someone stopping protection");
+        assert!(!marker.exists(), "the marker covers exactly one stop");
+
+        // The next manual stop, with no installer involved, is reported.
+        log_shutdown(&events, ShutdownCause::Manual, &marker);
+        let (entries, _) = events.since(1).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, EventKind::ManualStopDetected);
+    }
+
+    #[test]
+    fn a_stale_restart_marker_does_not_hide_a_manual_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = EventLog::open(dir.path().join("events.jsonl")).unwrap();
+        let marker = dir.path().join("restart-expected");
+        mark_restart_expected(&marker).unwrap();
+        let old = std::time::SystemTime::now() - RESTART_MARKER_MAX_AGE - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&marker).unwrap().set_modified(old).unwrap();
+
+        log_shutdown(&events, ShutdownCause::Manual, &marker);
+
+        let (entries, _) = events.since(1).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!marker.exists());
     }
 }

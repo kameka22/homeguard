@@ -111,12 +111,17 @@ pub async fn run(
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
     let shutdown_events = state.events.clone();
+    let restart_marker = paths.restart_expected_path();
+    // Any marker still here was meant for a process that's gone (or was
+    // dropped while no service was running): don't let it cover a future
+    // stop of this one.
+    shutdown::clear_restart_marker(&restart_marker);
     tokio::spawn(async move {
         let cause = match external_shutdown {
             Some(rx) => shutdown::wait_for_external_signal(rx).await,
             None => shutdown::wait_for_shutdown_signal().await,
         };
-        shutdown::log_shutdown(&shutdown_events, cause);
+        shutdown::log_shutdown(&shutdown_events, cause, &restart_marker);
         // Give in-flight requests (e.g. the app mid-`/v1/status`) a moment
         // to finish instead of dropping their connections outright.
         shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));

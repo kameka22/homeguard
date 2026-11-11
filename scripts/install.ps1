@@ -39,12 +39,15 @@ if ($computedSha256 -ne $AgentSha256.ToUpper()) {
     exit 1
 }
 
-# Réinstallation : l'ancien service verrouille le .exe tant qu'il tourne,
-# et garderait sinon l'ancien enrôlement chargé en mémoire. `install`
-# (plus bas) le reconfigure et le redémarre.
+# Re-install: the running service locks the .exe, and would otherwise keep
+# the previous enrollment loaded in memory. `install` (below) reconfigures
+# and restarts it.
 $existing = Get-Service -Name "homeguard-agent" -ErrorAction SilentlyContinue
 if ($existing -and $existing.Status -ne "Stopped") {
     Write-Host "Arrêt de l'agent déjà installé…"
+    # Tell the agent this stop is planned, so it isn't logged as a manual
+    # stop (see `shutdown::mark_restart_expected`).
+    Set-Content -Path "$env:ProgramData\HomeGuard\restart-expected" -Value (Get-Date -Format o) -ErrorAction SilentlyContinue
     Stop-Service -Name "homeguard-agent" -Force
     $existing.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(20))
 }

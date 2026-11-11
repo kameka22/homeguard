@@ -253,6 +253,34 @@ async fn enroll_succeeds_and_persists_a_usable_identity() {
 }
 
 #[tokio::test]
+async fn re_enrolling_sets_the_previous_identitys_event_log_aside() {
+    homeguard_common::install_crypto_provider();
+    let ca = Arc::new(Ca::generate().unwrap());
+    let addr = spawn_enrollment_server(ca.clone()).await;
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let paths = homeguard_agent::config::AgentPaths::new(data_dir.path());
+    paths.ensure_created().unwrap();
+    let old_log = "{\"seq\":1,\"at\":\"2026-01-01T00:00:00Z\",\"kind\":\"manual_stop_detected\",\"message\":\"old\"}\n";
+    std::fs::write(paths.events_path(), old_log).unwrap();
+
+    homeguard_agent::enroll::enroll(
+        &paths,
+        &data_dir.path().join("hosts"),
+        &format!("https://{addr}/v1/enroll"),
+        EXPECTED_TOKEN,
+        &ca.fingerprint_sha256(),
+    )
+    .await
+    .unwrap();
+
+    // The new identity starts with an empty history; the old one is kept
+    // for a human to read, but never served to the app.
+    assert!(!paths.events_path().exists());
+    assert_eq!(std::fs::read_to_string(paths.previous_events_path()).unwrap(), old_log);
+}
+
+#[tokio::test]
 async fn enroll_reports_domains_already_blocked_by_a_legacy_or_current_hosts_block() {
     homeguard_common::install_crypto_provider();
     let ca = Arc::new(Ca::generate().unwrap());

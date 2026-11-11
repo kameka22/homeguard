@@ -51,6 +51,18 @@ impl AgentPaths {
         self.data_dir.join("events.jsonl")
     }
 
+    /// Where `enroll` moves the previous identity's event log — kept for
+    /// a human to read, never served to the app.
+    pub fn previous_events_path(&self) -> PathBuf {
+        self.data_dir.join("events.previous.jsonl")
+    }
+
+    /// Dropped by an installer right before it stops the running service
+    /// on purpose (see `shutdown::mark_restart_expected`).
+    pub fn restart_expected_path(&self) -> PathBuf {
+        self.data_dir.join("restart-expected")
+    }
+
     /// Real system `hosts` file this agent must manage. Independent from
     /// `data_dir` since it always points at a fixed OS path (tests override
     /// it separately via `AgentConfig::hosts_path`).

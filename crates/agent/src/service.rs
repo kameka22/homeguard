@@ -81,6 +81,13 @@ pub fn is_installed() -> bool {
 }
 
 pub fn install(exe_path: &std::path::Path, data_dir: &std::path::Path) -> Result<(), ServiceError> {
+    // On a re-install the service is running and about to be restarted:
+    // that's this install, not someone switching protection off.
+    let marker = crate::config::AgentPaths::new(data_dir).restart_expected_path();
+    if let Err(e) = crate::shutdown::mark_restart_expected(&marker) {
+        // Worst case: one false "arrêt manuel" entry in the history.
+        tracing::warn!("impossible d'annoncer le redémarrage prévu : {e}");
+    }
     platform::install_service(exe_path, data_dir)
 }
 
