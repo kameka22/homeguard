@@ -39,6 +39,16 @@ if ($computedSha256 -ne $AgentSha256.ToUpper()) {
     exit 1
 }
 
+# Réinstallation : l'ancien service verrouille le .exe tant qu'il tourne,
+# et garderait sinon l'ancien enrôlement chargé en mémoire. `install`
+# (plus bas) le reconfigure et le redémarre.
+$existing = Get-Service -Name "homeguard-agent" -ErrorAction SilentlyContinue
+if ($existing -and $existing.Status -ne "Stopped") {
+    Write-Host "Arrêt de l'agent déjà installé…"
+    Stop-Service -Name "homeguard-agent" -Force
+    $existing.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(20))
+}
+
 Move-Item -Force $tmpBin $BinPath
 
 Write-Host "Ouverture du pare-feu (TCP 7878, UDP 5353)…"
