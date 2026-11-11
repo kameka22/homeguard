@@ -8,7 +8,7 @@
 //! worked and why it didn't, instead of only reacting to the click that
 //! happened to be on screen.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +16,7 @@ use std::time::Duration;
 use homeguard_app_core::client::{connect_to_agent, AgentClient, ClientError, TlsFailure};
 use homeguard_app_core::policy_engine::{resolve_policy_for_agent, PolicyEngineError};
 use homeguard_common::wire::AgentStatus;
+use futures_util::future::join_all;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Notify;
@@ -139,9 +140,11 @@ struct Pushed {
 /// its events, pushes a freshly-resolved policy and records the outcome.
 /// Never fails as such: a failure is an outcome too.
 pub async fn sync_one(state: &AppState, agent_id: &str, addr: SocketAddr) -> SyncOutcome {
-    // One push at a time: an automatic push and a manual click landing
-    // together would otherwise race on the policy version (If-Match).
-    let _guard = state.sync_lock.lock().await;
+    // One push at a time *per poste*: an automatic push and a manual click
+    // landing together would otherwise race on its policy version
+    // (If-Match). Different postes are pushed to concurrently.
+    let lock = state.sync_locks.for_agent(agent_id);
+    let _guard = lock.lock().await;
 
     let display = state
         .db
@@ -270,44 +273,59 @@ fn other(e: impl std::fmt::Display) -> SyncFailure {
     SyncFailure::new(SyncErrorKind::Other, e)
 }
 
+/// Per-poste push locks — see `sync_one`.
+#[derive(Default)]
+pub struct SyncLocks(std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
+
+impl SyncLocks {
+    fn for_agent(&self, agent_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        // The map only ever gains entries; a poisoned lock still holds a
+        // perfectly usable map.
+        let mut map = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(agent_id.to_string()).or_default().clone()
+    }
+}
+
 /// Syncs every known, non-revoked poste not in `skip`, at its last known
 /// address — the scan uses this for postes mDNS didn't surface, so a
 /// poste that's off still shows up as "injoignable" rather than silently
 /// missing from the results.
+///
+/// All postes are tried at once: a poste that's off costs up to the
+/// client timeout (5 s), and waiting for those one after the other would
+/// keep the "Envoi des règles…" spinner up for as many times that.
 pub async fn sync_known_agents(state: &AppState, skip: &HashSet<String>) -> Vec<SyncOutcome> {
     let Ok(agents) = state.db.list_agents() else {
         return Vec::new();
     };
-    let mut outcomes = Vec::new();
-    for agent in agents {
-        if agent.revoked || skip.contains(&agent.id) {
-            continue;
-        }
-        let addr = agent
-            .last_ip
-            .as_deref()
-            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
-            .map(|ip| SocketAddr::new(ip, AGENT_PORT));
-        let outcome = match addr {
-            Some(addr) => sync_one(state, &agent.id, addr).await,
-            None => {
-                let failure = SyncFailure::new(SyncErrorKind::NoAddress, "");
-                let _ = state.db.record_sync_result(&agent.id, false, &failure.message);
-                SyncOutcome {
-                    agent_id: agent.id.clone(),
-                    hostname: agent.display_name.filter(|n| !n.is_empty()).unwrap_or(agent.hostname),
-                    ok: false,
-                    detail: failure.message.clone(),
-                    error: Some(failure),
-                    domains_blocked: None,
-                    policy_version: None,
-                    integrity_ok: None,
+    let runs = agents
+        .into_iter()
+        .filter(|agent| !agent.revoked && !skip.contains(&agent.id))
+        .map(|agent| async move {
+            let addr = agent
+                .last_ip
+                .as_deref()
+                .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+                .map(|ip| SocketAddr::new(ip, AGENT_PORT));
+            match addr {
+                Some(addr) => sync_one(state, &agent.id, addr).await,
+                None => {
+                    let failure = SyncFailure::new(SyncErrorKind::NoAddress, "");
+                    let _ = state.db.record_sync_result(&agent.id, false, &failure.message);
+                    SyncOutcome {
+                        agent_id: agent.id.clone(),
+                        hostname: agent.display_name.filter(|n| !n.is_empty()).unwrap_or(agent.hostname),
+                        ok: false,
+                        detail: failure.message.clone(),
+                        error: Some(failure),
+                        domains_blocked: None,
+                        policy_version: None,
+                        integrity_ok: None,
+                    }
                 }
             }
-        };
-        outcomes.push(outcome);
-    }
-    outcomes
+        });
+    join_all(runs).await
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -338,7 +356,11 @@ impl AutoPush {
         tauri::async_runtime::spawn(async move {
             loop {
                 notify.notified().await;
-                tokio::time::sleep(AUTO_PUSH_DEBOUNCE).await;
+                // Wait until edits stop for AUTO_PUSH_DEBOUNCE. Each new
+                // request restarts the wait and is consumed here, so a
+                // burst gives exactly one push; a request arriving during
+                // the push itself gives one more afterwards.
+                while tokio::time::timeout(AUTO_PUSH_DEBOUNCE, notify.notified()).await.is_ok() {}
                 let state = app.state::<AppState>();
                 let _ = app.emit(EVENT_SYNC_STARTED, ());
                 let outcomes = sync_known_agents(&state, &HashSet::new()).await;

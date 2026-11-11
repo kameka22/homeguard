@@ -7,7 +7,7 @@ use homeguard_app_core::enrollment_server::EnrollmentState;
 use homeguard_common::Ca;
 
 use crate::app_identity::AppIdentity;
-use crate::sync::AutoPush;
+use crate::sync::{AutoPush, SyncLocks};
 
 const DEFAULT_TIMEZONE: &str = "Europe/Paris";
 
@@ -28,8 +28,8 @@ pub struct AppState {
     pub ca: Arc<Ca>,
     pub client_identity: AppIdentity,
     pub enrollment: Mutex<Option<EnrollmentSession>>,
-    /// Serializes policy pushes (see `sync::sync_one`).
-    pub sync_lock: tokio::sync::Mutex<()>,
+    /// Serializes policy pushes to the same poste (see `sync::sync_one`).
+    pub sync_locks: SyncLocks,
     /// Debounced automatic push after any rule change.
     pub auto_push: AutoPush,
 }
@@ -52,7 +52,7 @@ impl AppState {
             ca,
             client_identity,
             enrollment: Mutex::new(None),
-            sync_lock: tokio::sync::Mutex::new(()),
+            sync_locks: SyncLocks::default(),
             auto_push: AutoPush::default(),
         })
     }

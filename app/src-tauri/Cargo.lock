@@ -1776,6 +1776,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum-server",
+ "futures-util",
  "homeguard-app-core",
  "homeguard-common",
  "jiff 0.1.29",

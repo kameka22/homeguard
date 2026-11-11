@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
+use futures_util::future::join_all;
 use homeguard_app_core::client::connect_to_agent;
 use homeguard_app_core::db::{Agent, Assignment, Exception, Group, HistoryEntry, List, TargetKind};
 use homeguard_app_core::discovery::{browse_once, DiscoveredAgent};
@@ -103,6 +104,7 @@ pub async fn discover_and_sync_all(state: State<'_, AppState>, timeout_ms: u64) 
     let discovered = discover_agents(timeout_ms).await?;
     let mut outcomes = Vec::with_capacity(discovered.len());
     let mut seen = HashSet::new();
+    let mut to_sync = Vec::with_capacity(discovered.len());
 
     for agent in discovered {
         seen.insert(agent.agent_id.clone());
@@ -126,10 +128,15 @@ pub async fn discover_and_sync_all(state: State<'_, AppState>, timeout_ms: u64) 
             });
             continue;
         }
-        outcomes.push(sync::sync_one(&state, &agent.agent_id, agent.addr).await);
+        to_sync.push((agent.agent_id, agent.addr));
     }
 
-    outcomes.extend(sync::sync_known_agents(&state, &seen).await);
+    // Every poste at once (see `sync::sync_known_agents`).
+    let state: &AppState = &state;
+    let found = join_all(to_sync.iter().map(|(id, addr)| sync::sync_one(state, id, *addr)));
+    let (found, known) = tokio::join!(found, sync::sync_known_agents(state, &seen));
+    outcomes.extend(found);
+    outcomes.extend(known);
     Ok(outcomes)
 }
 
