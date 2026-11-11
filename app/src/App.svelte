@@ -16,6 +16,9 @@
   import CreateGroupDialog from "./lib/CreateGroupDialog.svelte";
   import CreateListDialog from "./lib/CreateListDialog.svelte";
   import Welcome from "./lib/Welcome.svelte";
+  import Toasts from "./lib/Toasts.svelte";
+  import { toast } from "./lib/toasts.js";
+  import { reportRun, setFeedbackHandlers, syncState } from "./lib/syncFeedback.js";
 
   // What fills the content area: a standalone screen ("dashboard" /
   // "history"), or one specific entity's detail — the sidebar plays the
@@ -38,6 +41,8 @@
   let groups = [];
   let lists = [];
   let liveStatus = {};
+  // True while an automatic push (after an edit) is running.
+  let autoSyncing = false;
 
   async function loadSidebar() {
     try {
@@ -62,6 +67,16 @@
     if (liveStatus[agent.id] === true) return "ok";
     if (liveStatus[agent.id] === false) return "danger";
     return "";
+  }
+
+  // Sidebar hint, by priority: a failed push, then rules not yet
+  // received, then how long since the poste was last seen.
+  function sidebarHint(agent) {
+    const st = syncState(agent);
+    if (st.kind === "failed") return { text: "échec", cls: "danger", title: st.detail };
+    if (st.kind === "pending") return { text: "en attente", cls: "warn", title: st.detail };
+    const seen = lastSeenLabel(agent);
+    return seen ? { text: seen, cls: "", title: "" } : null;
   }
 
   function lastSeenLabel(agent) {
@@ -116,6 +131,39 @@
     }
   });
 
+  setFeedbackHandlers({
+    openEnroll: () => (showEnroll = true),
+    goToAgent: (id) => (route = { kind: "agent", id }),
+  });
+
+  // Automatic push after any rule change (see src-tauri/src/sync.rs):
+  // say it went out — or which postes didn't get it — then refresh every
+  // screen so the per-poste sync state is current.
+  onMount(() => {
+    const offStart = listen("sync-started", () => (autoSyncing = true));
+    const offEnd = listen("sync-finished", (e) => {
+      autoSyncing = false;
+      reportRun(e.payload.outcomes, { trigger: "auto" });
+      refresh();
+    });
+    return () => { offStart.then((f) => f()); offEnd.then((f) => f()); };
+  });
+
+  function enrollClosed(e) {
+    showEnroll = false;
+    const enrolled = e.detail?.enrolled ?? [];
+    refresh();
+    if (enrolled.length > 0) {
+      const first = enrolled[0];
+      toast({
+        kind: "ok",
+        title: enrolled.length === 1 ? `${first.name} ajouté` : `${enrolled.length} postes ajoutés`,
+        detail: "Affectez-lui une liste de blocage : les règles lui seront envoyées aussitôt.",
+      });
+      route = { kind: "agent", id: first.agent_id };
+    }
+  }
+
   // "Préférences…" (⌘,) in the macOS app menu — the only way into
   // Réglages now that the sidebar's gear button is gone.
   onMount(() => {
@@ -156,7 +204,9 @@
             >
               <span class="status-dot {statusDotClass(agent)}"></span>
               {agent.display_name || agent.hostname}
-              {#if lastSeenLabel(agent)}<span class="nav-sub">{lastSeenLabel(agent)}</span>{/if}
+              {#each [sidebarHint(agent)].filter(Boolean) as hint}
+                <span class="nav-sub {hint.cls}" title={hint.title}>{hint.text}</span>
+              {/each}
             </button>
           {/each}
         {/if}
@@ -201,6 +251,9 @@
       </div>
 
       <div class="grow"></div>
+      {#if autoSyncing}
+        <div class="sidebar-sync" role="status"><span class="spinner"></span>Envoi des règles…</div>
+      {/if}
       <div class="row" style="border-top:1px solid var(--border); padding-top:var(--space-2); margin-top:var(--space-2);">
         <button class="sidebar-add" style="border-top:none; padding-top:7px; flex:1;" on:click={() => (showEnroll = true)}>
           <Icon name="plus" />Ajouter un poste
@@ -243,7 +296,7 @@
 {/if}
 
 {#if showEnroll}
-  <EnrollDialog on:close={() => { showEnroll = false; refresh(); }} />
+  <EnrollDialog on:close={enrollClosed} />
 {/if}
 {#if showSettings}
   <SettingsDialog on:close={() => (showSettings = false)} />
@@ -254,3 +307,5 @@
 {#if showCreateList}
   <CreateListDialog on:close={() => (showCreateList = false)} on:created={listCreated} />
 {/if}
+
+<Toasts />

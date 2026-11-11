@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "homeguard-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -962,7 +962,7 @@ dependencies = [
 
 [[package]]
 name = "homeguard-app-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "age",
  "axum",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "homeguard-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jiff",
  "pem",

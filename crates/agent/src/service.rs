@@ -81,6 +81,13 @@ pub fn is_installed() -> bool {
 }
 
 pub fn install(exe_path: &std::path::Path, data_dir: &std::path::Path) -> Result<(), ServiceError> {
+    // On a re-install the service is running and about to be restarted:
+    // that's this install, not someone switching protection off.
+    let marker = crate::config::AgentPaths::new(data_dir).restart_expected_path();
+    if let Err(e) = crate::shutdown::mark_restart_expected(&marker) {
+        // Worst case: one false "arrêt manuel" entry in the history.
+        tracing::warn!("impossible d'annoncer le redémarrage prévu : {e}");
+    }
     platform::install_service(exe_path, data_dir)
 }
 
@@ -129,7 +136,12 @@ WantedBy=multi-user.target\n",
     pub fn install_service(exe_path: &std::path::Path, data_dir: &std::path::Path) -> Result<(), ServiceError> {
         std::fs::write(UNIT_PATH, unit_file_contents(exe_path, data_dir))?;
         run_systemctl(&["daemon-reload"])?;
-        run_systemctl(&["enable", "--now", super::SERVICE_NAME])?;
+        run_systemctl(&["enable", super::SERVICE_NAME])?;
+        // `restart`, not `start`: on a re-install the service is usually
+        // already running — with the *previous* binary and identity loaded
+        // in memory. `enable --now` would leave that old process up, and
+        // the app would keep talking to a stale enrollment.
+        run_systemctl(&["restart", super::SERVICE_NAME])?;
         Ok(())
     }
 
@@ -307,8 +319,11 @@ mod platform {
     }
 
     pub fn install_service(exe_path: &std::path::Path, data_dir: &std::path::Path) -> Result<(), ServiceError> {
-        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)
-            .map_err(to_io)?;
+        let manager = ServiceManager::local_computer(
+            None::<&str>,
+            ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+        )
+        .map_err(to_io)?;
 
         let service_info = WinServiceInfo {
             name: OsString::from(super::SERVICE_NAME),
@@ -327,9 +342,26 @@ mod platform {
             account_password: None,
         };
 
-        let service = manager
-            .create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-            .map_err(to_io)?;
+        // Re-install (e.g. re-enrollment over an older agent): the service
+        // already exists and is most likely running the *previous* binary
+        // with the previous identity loaded in memory. Stop it, point it at
+        // the new configuration and start it again — rather than failing
+        // on "service already exists" and leaving that stale process up.
+        let existing = manager.open_service(
+            super::SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::START | ServiceAccess::CHANGE_CONFIG,
+        );
+        let service = match existing {
+            Ok(service) => {
+                let _ = service.stop();
+                wait_until_stopped(&service);
+                service.change_config(&service_info).map_err(to_io)?;
+                service
+            }
+            Err(_) => manager
+                .create_service(&service_info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
+                .map_err(to_io)?,
+        };
         service.start::<&std::ffi::OsStr>(&[]).map_err(to_io)?;
 
         // Auto-restart on failure, 5s later, indefinitely.
@@ -349,6 +381,18 @@ mod platform {
         let _ = service.stop();
         service.delete().map_err(to_io)?;
         Ok(())
+    }
+
+    /// Polls for up to ~20 s — the agent restores nothing on a plain stop,
+    /// so in practice it's down within a second.
+    fn wait_until_stopped(service: &windows_service::service::Service) {
+        for _ in 0..40 {
+            match service.query_status() {
+                Ok(status) if status.current_state == ServiceState::Stopped => return,
+                Err(_) => return,
+                _ => std::thread::sleep(Duration::from_millis(500)),
+            }
+        }
     }
 
     pub fn is_installed() -> bool {

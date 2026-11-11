@@ -1,18 +1,19 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
+use futures_util::future::join_all;
 use homeguard_app_core::client::connect_to_agent;
 use homeguard_app_core::db::{Agent, Assignment, Exception, Group, HistoryEntry, List, TargetKind};
 use homeguard_app_core::discovery::{browse_once, DiscoveredAgent};
 use homeguard_app_core::enrollment_server::EnrollmentState;
-use homeguard_app_core::policy_engine::resolve_policy_for_agent;
 use homeguard_common::policy::TimeWindow;
-use homeguard_common::wire::AgentStatus;
 use tauri::State;
 
 use crate::state::{AppState, EnrollmentSession};
+use crate::sync::{self, SyncOutcome};
 
 // Every command's error becomes a plain String on the JS side — good
 // enough for an admin tool where the message itself is the useful part.
@@ -20,6 +21,14 @@ type CmdResult<T> = Result<T, String>;
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+/// Passes `result` through, and on success schedules an automatic push of
+/// the new rules to every poste (see `sync::AutoPush`).
+fn changed<T, E: std::fmt::Display>(state: &AppState, result: Result<T, E>) -> CmdResult<T> {
+    let value = result.map_err(err)?;
+    state.rules_changed();
+    Ok(value)
 }
 
 // --- agents ------------------------------------------------------------
@@ -81,32 +90,24 @@ pub async fn discover_agents(timeout_ms: u64) -> CmdResult<Vec<DiscoveredAgent>>
         .map_err(err)
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SyncOutcome {
-    pub agent_id: String,
-    pub hostname: String,
-    pub ok: bool,
-    pub detail: String,
-    /// `Some(false)` is a real écart: the agent answered but its hosts
-    /// file no longer matches what its policy says it should. `None`
-    /// means we couldn't even ask (agent unreachable, revoked...).
-    pub integrity_ok: Option<bool>,
-}
-
-/// The "scan on launch" / "⟳" action: browse mDNS, and for every agent
-/// that answers, make sure it has a DB record (creating one if this is
-/// the first time we've seen it, e.g. after a fresh install — an agent
-/// can only present a certificate our CA actually signed, so trusting a
-/// newly-seen `agent_id` here is no different from trusting the mTLS
-/// handshake itself) and push it whatever policy currently applies.
-/// Revoked agents are recorded but left alone — `sync_agent` (via
-/// `connect_to_agent`) refuses to talk to them.
+/// The "scan on launch" / "Tout synchroniser" action: browse mDNS, and
+/// for every agent that answers, make sure it has a DB record (creating
+/// one if this is the first time we've seen it, e.g. after a fresh
+/// install — an agent can only present a certificate our CA actually
+/// signed, so trusting a newly-seen `agent_id` here is no different from
+/// trusting the mTLS handshake itself) and push it whatever policy
+/// currently applies. Then every *known* poste mDNS didn't surface is
+/// tried at its last address too, so one that's off is reported as
+/// injoignable instead of silently missing from the results.
 #[tauri::command]
 pub async fn discover_and_sync_all(state: State<'_, AppState>, timeout_ms: u64) -> CmdResult<Vec<SyncOutcome>> {
     let discovered = discover_agents(timeout_ms).await?;
     let mut outcomes = Vec::with_capacity(discovered.len());
+    let mut seen = HashSet::new();
+    let mut to_sync = Vec::with_capacity(discovered.len());
 
     for agent in discovered {
+        seen.insert(agent.agent_id.clone());
         if let Err(e) = state.db.upsert_agent(
             &agent.agent_id,
             &agent.hostname,
@@ -120,102 +121,31 @@ pub async fn discover_and_sync_all(state: State<'_, AppState>, timeout_ms: u64) 
                 hostname: agent.hostname,
                 ok: false,
                 detail: err(e),
+                error: None,
+                domains_blocked: None,
+                policy_version: None,
                 integrity_ok: None,
             });
             continue;
         }
-
-        let result = sync_agent(state.clone(), agent.agent_id.clone(), agent.addr.to_string()).await;
-        outcomes.push(match result {
-            Ok(sync) => {
-                let mut detail = format!(
-                    "{} domaine(s) bloqué(s), politique v{}",
-                    sync.post.domains_blocked_now, sync.post.applied_policy_version
-                );
-                if !sync.pre.integrity_ok {
-                    detail.push_str(" — écart détecté sur le hosts avant cette synchronisation");
-                }
-                SyncOutcome {
-                    agent_id: agent.agent_id,
-                    hostname: agent.hostname,
-                    ok: true,
-                    detail,
-                    integrity_ok: Some(sync.pre.integrity_ok),
-                }
-            }
-            Err(e) => SyncOutcome {
-                agent_id: agent.agent_id,
-                hostname: agent.hostname,
-                ok: false,
-                detail: e,
-                integrity_ok: None,
-            },
-        });
+        to_sync.push((agent.agent_id, agent.addr));
     }
 
+    // Every poste at once (see `sync::sync_known_agents`).
+    let state: &AppState = &state;
+    let found = join_all(to_sync.iter().map(|(id, addr)| sync::sync_one(state, id, *addr)));
+    let (found, known) = tokio::join!(found, sync::sync_known_agents(state, &seen));
+    outcomes.extend(found);
+    outcomes.extend(known);
     Ok(outcomes)
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SyncResult {
-    /// Status as found *before* this sync pushed anything — this is the
-    /// one that actually reflects drift (a hand-edited hosts file, a
-    /// stopped self-heal...). Pushing a fresh policy below usually
-    /// reconciles it, so checking `post` for that would nearly always
-    /// read back "fine".
-    pub pre: AgentStatus,
-    pub post: AgentStatus,
-}
-
-/// Connects to `addr`, fetches status, pushes a freshly-resolved policy
-/// (from whatever groups/lists/assignments currently apply), and returns
-/// both the status from before and after that push. This is what
-/// "Synchroniser" and the auto-sync on launch both call.
+/// Pushes the current policy to one poste. Always resolves: a failure
+/// comes back as an outcome with `ok: false` and a classified `error`.
 #[tauri::command]
-pub async fn sync_agent(state: State<'_, AppState>, agent_id: String, addr: String) -> CmdResult<SyncResult> {
+pub async fn sync_agent(state: State<'_, AppState>, agent_id: String, addr: String) -> CmdResult<SyncOutcome> {
     let addr: SocketAddr = addr.parse().map_err(err)?;
-    let client = connect_to_agent(
-        &state.db,
-        &agent_id,
-        addr,
-        &state.client_identity.cert_pem,
-        &state.client_identity.key_pem,
-        state.ca.cert_der(),
-    )
-    .map_err(err)?;
-
-    let current_status = client.status().await.map_err(err)?;
-
-    // Pull any agent-side events (self-heal, schedule transitions, a
-    // manual stop...) into the unified history before pushing a new
-    // policy — that push will itself emit an event, but we'll only see
-    // it on the *next* sync, which is fine.
-    if let Some(agent) = state.db.get_agent(&agent_id).map_err(err)? {
-        let page = client.events_since(agent.events_cursor).await.map_err(err)?;
-        for event in &page.events {
-            state.db.record_agent_event(&agent_id, event).map_err(err)?;
-        }
-        if page.next_seq != agent.events_cursor {
-            state.db.set_agent_events_cursor(&agent_id, page.next_seq).map_err(err)?;
-        }
-    }
-
-    let timezone = state.timezone();
-    let version = state.db.bump_policy_version(&agent_id).map_err(err)?;
-    // TODO: protection flags (self-heal / anti-DoH) should become a
-    // per-agent or per-group setting; both default on for now.
-    let policy = resolve_policy_for_agent(&state.db, &agent_id, version, &timezone, true, true, state.auto_www()).map_err(err)?;
-
-    client
-        .push_policy(&policy, Some(current_status.applied_policy_version))
-        .await
-        .map_err(err)?;
-    let _ = state
-        .db
-        .append_history("app", Some(&agent_id), "policy_pushed", &format!("politique v{version} envoyée"));
-
-    let post = client.status().await.map_err(err)?;
-    Ok(SyncResult { pre: current_status, post })
+    Ok(sync::sync_one(&state, &agent_id, addr).await)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -531,17 +461,17 @@ pub fn create_group(state: State<'_, AppState>, name: String) -> CmdResult<Strin
 
 #[tauri::command]
 pub fn delete_group(state: State<'_, AppState>, group_id: String) -> CmdResult<()> {
-    state.db.delete_group(&group_id).map_err(err)
+    changed(&state, state.db.delete_group(&group_id))
 }
 
 #[tauri::command]
 pub fn add_group_member(state: State<'_, AppState>, group_id: String, agent_id: String) -> CmdResult<()> {
-    state.db.add_group_member(&group_id, &agent_id).map_err(err)
+    changed(&state, state.db.add_group_member(&group_id, &agent_id))
 }
 
 #[tauri::command]
 pub fn remove_group_member(state: State<'_, AppState>, group_id: String, agent_id: String) -> CmdResult<()> {
-    state.db.remove_group_member(&group_id, &agent_id).map_err(err)
+    changed(&state, state.db.remove_group_member(&group_id, &agent_id))
 }
 
 #[tauri::command]
@@ -563,12 +493,12 @@ pub fn create_list(state: State<'_, AppState>, name: String, domains: Vec<String
 
 #[tauri::command]
 pub fn update_list_domains(state: State<'_, AppState>, list_id: String, domains: Vec<String>) -> CmdResult<()> {
-    state.db.update_list_domains(&list_id, &domains).map_err(err)
+    changed(&state, state.db.update_list_domains(&list_id, &domains))
 }
 
 #[tauri::command]
 pub fn delete_list(state: State<'_, AppState>, list_id: String) -> CmdResult<()> {
-    state.db.delete_list(&list_id).map_err(err)
+    changed(&state, state.db.delete_list(&list_id))
 }
 
 #[tauri::command]
@@ -626,7 +556,7 @@ pub fn list_domain_variants(state: State<'_, AppState>, list_id: String) -> CmdR
 
 #[tauri::command]
 pub fn set_list_excluded_variants(state: State<'_, AppState>, list_id: String, excluded_variants: Vec<String>) -> CmdResult<()> {
-    state.db.set_list_excluded_variants(&list_id, &excluded_variants).map_err(err)
+    changed(&state, state.db.set_list_excluded_variants(&list_id, &excluded_variants))
 }
 
 // --- assignments & exceptions ------------------------------------------
@@ -661,15 +591,12 @@ pub fn create_assignment(
     schedule: Option<Vec<TimeWindow>>,
 ) -> CmdResult<String> {
     let kind = parse_target_kind(&target_kind)?;
-    state
-        .db
-        .create_assignment(&list_id, kind, &target_id, schedule.as_deref())
-        .map_err(err)
+    changed(&state, state.db.create_assignment(&list_id, kind, &target_id, schedule.as_deref()))
 }
 
 #[tauri::command]
 pub fn delete_assignment(state: State<'_, AppState>, assignment_id: String) -> CmdResult<()> {
-    state.db.delete_assignment(&assignment_id).map_err(err)
+    changed(&state, state.db.delete_assignment(&assignment_id))
 }
 
 #[tauri::command]
@@ -678,7 +605,7 @@ pub fn update_assignment_schedule(
     assignment_id: String,
     schedule: Option<Vec<TimeWindow>>,
 ) -> CmdResult<()> {
-    state.db.update_assignment_schedule(&assignment_id, schedule.as_deref()).map_err(err)
+    changed(&state, state.db.update_assignment_schedule(&assignment_id, schedule.as_deref()))
 }
 
 #[tauri::command]
@@ -697,12 +624,12 @@ pub fn create_exception(
 ) -> CmdResult<String> {
     let kind = parse_target_kind(&target_kind)?;
     let until: jiff::Timestamp = until.parse().map_err(err)?;
-    state.db.create_exception(kind, &target_id, &domains, until).map_err(err)
+    changed(&state, state.db.create_exception(kind, &target_id, &domains, until))
 }
 
 #[tauri::command]
 pub fn delete_exception(state: State<'_, AppState>, exception_id: String) -> CmdResult<()> {
-    state.db.delete_exception(&exception_id).map_err(err)
+    changed(&state, state.db.delete_exception(&exception_id))
 }
 
 fn parse_target_kind(s: &str) -> CmdResult<TargetKind> {
@@ -1107,7 +1034,7 @@ pub fn get_timezone(state: State<'_, AppState>) -> String {
 
 #[tauri::command]
 pub fn set_timezone(state: State<'_, AppState>, timezone: String) -> CmdResult<()> {
-    state.db.set_setting("timezone", &timezone).map_err(err)
+    changed(&state, state.db.set_setting("timezone", &timezone))
 }
 
 /// "system" (follow macOS), "light", or "dark" — defaults to "system".
@@ -1188,7 +1115,7 @@ pub fn get_auto_www(state: State<'_, AppState>) -> CmdResult<bool> {
 
 #[tauri::command]
 pub fn set_auto_www(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
-    state.db.set_setting("auto_www", if enabled { "true" } else { "false" }).map_err(err)
+    changed(&state, state.db.set_setting("auto_www", if enabled { "true" } else { "false" }))
 }
 
 // --- domain alias catalog ----------------------------------------------
@@ -1200,12 +1127,12 @@ pub fn list_aliases(state: State<'_, AppState>) -> CmdResult<Vec<homeguard_commo
 
 #[tauri::command]
 pub fn upsert_alias(state: State<'_, AppState>, base_domain: String, variants: Vec<String>) -> CmdResult<()> {
-    state.db.upsert_alias(&base_domain, &variants).map_err(err)
+    changed(&state, state.db.upsert_alias(&base_domain, &variants))
 }
 
 #[tauri::command]
 pub fn delete_alias(state: State<'_, AppState>, base_domain: String) -> CmdResult<()> {
-    state.db.delete_alias(&base_domain).map_err(err)
+    changed(&state, state.db.delete_alias(&base_domain))
 }
 
 /// Plain-text file write, no encryption — for exports that aren't the
@@ -1255,6 +1182,7 @@ pub async fn import_config(app: tauri::AppHandle, state: State<'_, AppState>, pa
     let _ = state
         .db
         .append_history("app", None, "config_imported", "configuration importée");
+    state.rules_changed();
 
     Ok(restart_needed)
 }

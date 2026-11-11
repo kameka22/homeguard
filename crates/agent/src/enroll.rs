@@ -98,9 +98,22 @@ pub async fn enroll(
         &enrolled.ca_cert_pem,
         &enrolled.agent_id,
     )?;
+    start_fresh_event_log(paths);
     let policy_json = serde_json::to_string_pretty(&enrolled.initial_policy)
         .expect("Policy always serializes");
     std::fs::write(paths.policy_path(), policy_json)?;
 
     Ok(enrolled)
+}
+
+/// A new enrollment is a new poste for the app (new `agent_id`, events
+/// cursor back to 0): if the previous identity's event log stayed in place,
+/// the app would import that whole past history as this poste's — the
+/// re-install's own service stop included. Set it aside instead.
+fn start_fresh_event_log(paths: &AgentPaths) {
+    match std::fs::rename(paths.events_path(), paths.previous_events_path()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("impossible d'archiver l'ancien journal d'événements : {e}"),
+    }
 }

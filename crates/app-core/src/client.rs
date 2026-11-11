@@ -33,6 +33,59 @@ pub enum ClientError {
     Db(#[from] DbError),
 }
 
+/// What went wrong at the TLS layer, when a request failed there — see
+/// [`ClientError::tls_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsFailure {
+    /// The handshake ran and one side refused the other: the agent's
+    /// certificate isn't signed by this app's CA, or the agent refused this
+    /// app's client certificate (it answers with a fatal alert). In
+    /// practice: a poste still running an identity from another
+    /// enrollment.
+    Rejected,
+    /// Whatever answered doesn't speak TLS at all (plain HTTP, another
+    /// service on that port).
+    NotTls,
+}
+
+impl ClientError {
+    /// Classifies a failed request by the actual `rustls::Error` it carries
+    /// — never by the error's text, which also contains the URL (and so the
+    /// poste's name). `None` when the failure isn't a TLS one (refused,
+    /// reset, timed out...).
+    pub fn tls_failure(&self) -> Option<TlsFailure> {
+        let ClientError::Request(e) = self else {
+            return None;
+        };
+        find_rustls_error(e).map(|tls| match tls {
+            rustls::Error::InvalidMessage(_)
+            | rustls::Error::InappropriateMessage { .. }
+            | rustls::Error::InappropriateHandshakeMessage { .. } => TlsFailure::NotTls,
+            _ => TlsFailure::Rejected,
+        })
+    }
+}
+
+/// Walks an error's source chain looking for a `rustls::Error`. hyper and
+/// tokio-rustls wrap it in (possibly nested) `std::io::Error`s, whose
+/// `source()` skips the wrapped error itself, so each one's inner error
+/// has to be inspected explicitly.
+fn find_rustls_error<'a>(e: &'a (dyn std::error::Error + 'static)) -> Option<&'a rustls::Error> {
+    let mut current = Some(e);
+    while let Some(err) = current {
+        if let Some(tls) = err.downcast_ref::<rustls::Error>() {
+            return Some(tls);
+        }
+        if let Some(inner) = err.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()) {
+            if let Some(tls) = find_rustls_error(inner) {
+                return Some(tls);
+            }
+        }
+        current = err.source();
+    }
+    None
+}
+
 /// The stable name an agent's certificate is issued for (see
 /// `enrollment_server::enroll_handler`), independent of whatever IP it
 /// happens to have right now. Connecting always goes through this name —

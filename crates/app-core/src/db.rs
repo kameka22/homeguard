@@ -49,7 +49,16 @@ CREATE TABLE IF NOT EXISTS agents (
     -- Domains the agent found already blocked in its hosts file at
     -- enrollment (current or pre-rewrite marker block) — surfaced once in
     -- the UI so the admin can fold them into a real list, then cleared.
-    pending_discovered_domains_json TEXT NOT NULL DEFAULT '[]'
+    pending_discovered_domains_json TEXT NOT NULL DEFAULT '[]',
+    -- Outcome of the last policy push attempt (manual, scan or automatic):
+    -- when, whether it worked, and a human-readable detail — what the
+    -- per-poste "synchronisé il y a 3 min" / "échec : injoignable" reads.
+    last_sync_at     TEXT,
+    last_sync_ok     INTEGER,
+    last_sync_detail TEXT,
+    -- 1 when rules changed in the app since this poste last accepted a
+    -- policy — i.e. what it enforces right now may be out of date.
+    policy_dirty INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS groups (
@@ -129,6 +138,10 @@ pub struct Agent {
     pub events_cursor: u64,
     pub tags: Vec<String>,
     pub pending_discovered_domains: Vec<String>,
+    pub last_sync_at: Option<String>,
+    pub last_sync_ok: Option<bool>,
+    pub last_sync_detail: Option<String>,
+    pub policy_dirty: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -213,6 +226,10 @@ fn migrate_add_missing_columns(conn: &Connection) -> Result<()> {
         ("agents", "arch", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("agents", "tags_json", "TEXT NOT NULL DEFAULT '[]'"),
         ("agents", "pending_discovered_domains_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("agents", "last_sync_at", "TEXT"),
+        ("agents", "last_sync_ok", "INTEGER"),
+        ("agents", "last_sync_detail", "TEXT"),
+        ("agents", "policy_dirty", "INTEGER NOT NULL DEFAULT 0"),
         ("lists", "color", "TEXT NOT NULL DEFAULT ''"),
         ("lists", "excluded_variants_json", "TEXT NOT NULL DEFAULT '[]'"),
     ];
@@ -356,6 +373,38 @@ impl Db {
             .lock()
             .unwrap()
             .execute("UPDATE agents SET pending_discovered_domains_json = '[]' WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Flags every non-revoked poste as having rules it hasn't received
+    /// yet — called on any change that can alter a resolved policy. Cleared
+    /// per poste by a successful [`Db::record_sync_result`].
+    pub fn mark_all_agents_dirty(&self) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE agents SET policy_dirty = 1 WHERE revoked = 0", [])?;
+        Ok(())
+    }
+
+    /// Records the outcome of a policy push attempt. A success also clears
+    /// `policy_dirty` and bumps `last_seen_at`; a failure leaves
+    /// `policy_dirty` as it was (still pending if it was).
+    pub fn record_sync_result(&self, id: &str, ok: bool, detail: &str) -> Result<()> {
+        let now = jiff::Timestamp::now().to_string();
+        let conn = self.conn.lock().unwrap();
+        if ok {
+            conn.execute(
+                "UPDATE agents SET last_sync_at = ?1, last_sync_ok = 1, last_sync_detail = ?2,
+                    policy_dirty = 0, last_seen_at = ?1 WHERE id = ?3",
+                params![now, detail, id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE agents SET last_sync_at = ?1, last_sync_ok = 0, last_sync_detail = ?2 WHERE id = ?3",
+                params![now, detail, id],
+            )?;
+        }
         Ok(())
     }
 
@@ -883,6 +932,10 @@ fn row_to_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         events_cursor: row.get::<_, i64>("events_cursor")? as u64,
         tags,
         pending_discovered_domains,
+        last_sync_at: row.get("last_sync_at")?,
+        last_sync_ok: row.get::<_, Option<i64>>("last_sync_ok")?.map(|v| v != 0),
+        last_sync_detail: row.get("last_sync_detail")?,
+        policy_dirty: row.get::<_, i64>("policy_dirty")? != 0,
     })
 }
 
@@ -1172,6 +1225,32 @@ mod tests {
         let updated = db.get_list(&list_id).unwrap().unwrap();
         assert_eq!(updated.color, "#e2822a");
         assert_eq!(updated.excluded_variants, vec!["m.roblox.com".to_string()]);
+    }
+
+    #[test]
+    fn sync_result_and_dirty_flag_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("a1", "PORTABLE-LEO", "windows", "x86_64", None, None).unwrap();
+        let fresh = db.get_agent("a1").unwrap().unwrap();
+        assert!(!fresh.policy_dirty);
+        assert_eq!(fresh.last_sync_ok, None);
+
+        db.mark_all_agents_dirty().unwrap();
+        assert!(db.get_agent("a1").unwrap().unwrap().policy_dirty);
+
+        // A failed push keeps the poste pending.
+        db.record_sync_result("a1", false, "injoignable").unwrap();
+        let failed = db.get_agent("a1").unwrap().unwrap();
+        assert!(failed.policy_dirty);
+        assert_eq!(failed.last_sync_ok, Some(false));
+        assert_eq!(failed.last_sync_detail.as_deref(), Some("injoignable"));
+
+        // A successful one clears it.
+        db.record_sync_result("a1", true, "12 domaines bloqués").unwrap();
+        let ok = db.get_agent("a1").unwrap().unwrap();
+        assert!(!ok.policy_dirty);
+        assert_eq!(ok.last_sync_ok, Some(true));
+        assert!(ok.last_sync_at.is_some());
     }
 
     #[test]
