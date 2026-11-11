@@ -1,5 +1,6 @@
 <script>
   import { onMount, createEventDispatcher } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import { api } from "../api.js";
   import Icon from "../Icon.svelte";
   import { remedyFor, reportOutcome, reportRun, syncState } from "../syncFeedback.js";
@@ -50,6 +51,18 @@
       loadError = String(e);
     }
   }
+
+  // An automatic push (after an edit) is newer than the last scan for
+  // every poste it reached: replace those rows, so a failure the push has
+  // since fixed doesn't linger in "à traiter". Postes the scan didn't list
+  // show up through their recorded sync state instead (see attentionItems).
+  onMount(() => {
+    const off = listen("sync-finished", (e) => {
+      const latest = new Map(e.payload.outcomes.map((o) => [o.agent_id, o]));
+      scanResults = scanResults.map((r) => latest.get(r.agent_id) ?? r);
+    });
+    return () => { off.then((f) => f()); };
+  });
 
   async function scan(trigger = "manual") {
     scanning = true;
