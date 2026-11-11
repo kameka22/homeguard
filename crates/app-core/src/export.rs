@@ -116,6 +116,8 @@ pub fn apply_import(db: &Db, config: &ExportedConfig) -> Result<(), ExportError>
             db.revoke_agent(&agent.id)?;
         }
         db.set_agent_events_cursor(&agent.id, agent.events_cursor)?;
+        db.set_agent_tags(&agent.id, &agent.tags)?;
+        db.set_agent_pending_discovered_domains(&agent.id, &agent.pending_discovered_domains)?;
     }
 
     for group in &config.groups {
@@ -126,7 +128,7 @@ pub fn apply_import(db: &Db, config: &ExportedConfig) -> Result<(), ExportError>
     }
 
     for list in &config.lists {
-        db.upsert_list(&list.id, &list.name, &list.domains)?;
+        db.upsert_list(&list.id, &list.name, &list.domains, &list.color, &list.excluded_variants)?;
     }
 
     for assignment in &config.assignments {

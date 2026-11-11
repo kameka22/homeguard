@@ -38,8 +38,19 @@ pub enum ClientError {
 /// happens to have right now. Connecting always goes through this name —
 /// see [`AgentClient::new`] — so a DHCP lease change doesn't invalidate
 /// the 2-year certificate the way pinning the SAN to an IP would.
+///
+/// Idempotent: on some systems the OS hostname itself already ends in
+/// `.local` (some Linux mDNS/Avahi setups report it that way), and mDNS
+/// discovery's own `hostname` field always has it appended too (see
+/// `discovery::to_discovered_agent`) — appending it unconditionally would
+/// double it into `foo.local.local`, which then simply fails to connect
+/// (nothing resolves that name to anything).
 pub fn stable_agent_name(hostname: &str) -> String {
-    format!("{hostname}.local")
+    if hostname.to_ascii_lowercase().ends_with(".local") {
+        hostname.to_string()
+    } else {
+        format!("{hostname}.local")
+    }
 }
 
 /// Build a client for `agent_id`, refusing to connect if the app has
@@ -159,6 +170,20 @@ impl AgentClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_agent_name_appends_dot_local_once() {
+        assert_eq!(stable_agent_name("PC-SALON"), "PC-SALON.local");
+    }
+
+    #[test]
+    fn stable_agent_name_does_not_double_an_already_present_dot_local() {
+        // Some Linux mDNS/Avahi setups report the OS hostname itself as
+        // already ending in `.local` — appending it again produced
+        // `foo.local.local`, which then simply failed to connect.
+        assert_eq!(stable_agent_name("laurent-ThinkPad-L460.local"), "laurent-ThinkPad-L460.local");
+        assert_eq!(stable_agent_name("foo.LOCAL"), "foo.LOCAL");
+    }
 
     #[test]
     fn connect_to_agent_refuses_a_revoked_agent_before_touching_the_network() {

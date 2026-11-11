@@ -29,10 +29,12 @@
     <circle cx="12" cy="12" r="8.5" />
     <path d="M12 7.5V12l3.2 2" />
   {:else if name === "settings"}
-    <path d="M4 6h9M17 6h3M4 12h3M9 12h11M4 18h13M19 18h1" />
-    <circle cx="13" cy="6" r="2.1" />
-    <circle cx="7" cy="12" r="2.1" />
-    <circle cx="17" cy="18" r="2.1" />
+    <circle cx="12" cy="12" r="2.5" />
+    <path
+      d="M12 8.7V6M12 15.3V18M15.3 12H18M8.7 12H6
+         M14.33 9.67 16.24 7.76M9.67 9.67 7.76 7.76
+         M14.33 14.33 16.24 16.24M9.67 14.33 7.76 16.24"
+    />
   {:else if name === "plus"}
     <path d="M12 5v14M5 12h14" />
   {:else if name === "x"}

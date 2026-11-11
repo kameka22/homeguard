@@ -5,6 +5,7 @@
   import { api } from "./lib/api.js";
   import { listColor } from "./lib/colors.js";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { listen } from "@tauri-apps/api/event";
   import Dashboard from "./lib/views/Dashboard.svelte";
   import AgentDetail from "./lib/views/AgentDetail.svelte";
   import GroupDetail from "./lib/views/GroupDetail.svelte";
@@ -114,6 +115,13 @@
       onboardingDone = true; // don't block the whole app on a settings read failing
     }
   });
+
+  // "Préférences…" (⌘,) in the macOS app menu — the only way into
+  // Réglages now that the sidebar's gear button is gone.
+  onMount(() => {
+    const unlisten = listen("open-settings", () => (showSettings = true));
+    return () => { unlisten.then((f) => f()); };
+  });
 </script>
 
 {#if onboardingDone === false}
@@ -182,7 +190,7 @@
             class:active={route.kind === "list" && route.id === list.id}
             on:click={() => (route = { kind: "list", id: list.id })}
           >
-            <span class="swatch" style="background:{listColor(list.id)};"></span>
+            <span class="swatch" style="background:{listColor(list)};"></span>
             {list.name}
             <span class="nav-badge">{list.domains.length}</span>
           </button>
@@ -196,9 +204,6 @@
       <div class="row" style="border-top:1px solid var(--border); padding-top:var(--space-2); margin-top:var(--space-2);">
         <button class="sidebar-add" style="border-top:none; padding-top:7px; flex:1;" on:click={() => (showEnroll = true)}>
           <Icon name="plus" />Ajouter un poste
-        </button>
-        <button class="toolbar-icon-btn" aria-label="Réglages" on:click={() => (showSettings = true)}>
-          <Icon name="settings" />
         </button>
       </div>
     </nav>

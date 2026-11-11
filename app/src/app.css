@@ -690,6 +690,53 @@ h1, h2 {
 }
 
 /* ---------------------------------------------------------------------
+   Suggested-sites picker (list detail → "Ajouter depuis des suggestions")
+   ------------------------------------------------------------------- */
+
+.suggest-body {
+  display: flex;
+  gap: var(--space-4);
+  min-height: 320px;
+  max-height: 55vh;
+}
+
+.suggest-categories {
+  width: 180px;
+  flex-shrink: 0;
+  overflow-y: auto;
+}
+
+.suggest-sites {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.suggest-site-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 7px var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.suggest-site-row:hover {
+  background: color-mix(in srgb, var(--text) 6%, transparent);
+}
+
+.suggest-site-row.disabled {
+  cursor: default;
+  color: var(--text-faint);
+}
+
+.suggest-site-row.disabled:hover {
+  background: transparent;
+}
+
+/* ---------------------------------------------------------------------
    Dashboard timeline — blocked/open segments over the next 24h
    ------------------------------------------------------------------- */
 
@@ -853,8 +900,8 @@ h1, h2 {
 .status-dot.warn { background: var(--warn); }
 .status-dot.danger { background: var(--danger); }
 
-/* A small derived color swatch for a list — computed client-side from the
-   list's id (see listColor() in each view), not a stored property yet. */
+/* A list's color swatch — its own stored `color`, or a fallback derived
+   from its id when unset (see listColor() in colors.js). */
 .swatch {
   width: 9px;
   height: 9px;
@@ -1054,6 +1101,29 @@ button.pill:hover:not(:disabled) {
   color: var(--text);
 }
 
+.chip.excluded {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-faint);
+  text-decoration: line-through;
+}
+
+/* ---------------------------------------------------------------------
+   List color picker
+   ------------------------------------------------------------------- */
+
+button.color-swatch-btn {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 50%;
+}
+
+button.color-swatch-btn.selected {
+  border-color: var(--text);
+}
+
 /* ---------------------------------------------------------------------
    Icons
    ------------------------------------------------------------------- */
@@ -1202,6 +1272,11 @@ button.pill:hover:not(:disabled) {
 .modal-icon.danger {
   background: var(--danger-weak);
   color: var(--danger);
+}
+
+.modal-icon.warn {
+  background: var(--warn-weak);
+  color: var(--warn);
 }
 
 .modal-title {

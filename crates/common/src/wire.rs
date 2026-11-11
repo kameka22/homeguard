@@ -71,6 +71,16 @@ pub struct EnrollRequest {
     pub os: String,
     pub arch: String,
     pub agent_version: String,
+    /// Domains already present in this machine's `hosts` file managed
+    /// block — current markers, or a pre-rewrite `SITEBLOCKER` one —
+    /// collected *before* enrollment touches anything. Lets the app
+    /// surface "this poste already had rules" instead of silently
+    /// discarding them. Empty for a poste with no prior block, or an
+    /// older agent build that doesn't send this field at all (hence
+    /// `#[serde(default)]`, so the app's enrollment server doesn't reject
+    /// requests from agents that predate this).
+    #[serde(default)]
+    pub existing_blocked_domains: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

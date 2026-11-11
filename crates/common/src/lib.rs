@@ -6,7 +6,7 @@ pub mod tls;
 pub mod wire;
 
 pub use aliases::{default_catalog, expand_domains, AliasEntry};
-pub use hosts::{apply_block, extract_block, is_valid_domain, normalize_domain, ApplyResult};
+pub use hosts::{apply_block, extract_block, extract_legacy_or_current_domains, is_valid_domain, normalize_domain, ApplyResult};
 pub use pki::{fingerprint_of_pem, generate_agent_identity, sha256_hex, Ca, CertifiedKey, IssuedCert, PkiError};
 pub use policy::{Day, Exception, Policy, PolicyError, Protection, Rule, TimeWindow};
 pub use tls::{

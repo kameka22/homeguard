@@ -4,7 +4,7 @@
 //! reach the agent's own mTLS API.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -64,6 +64,59 @@ async fn enroll_handler_lying_about_ca(State(ca): State<Arc<Ca>>, Json(req): Jso
     .into_response()
 }
 
+/// Same as `enroll_handler`, but also stashes the request it received so
+/// a test can inspect what the agent actually sent — specifically
+/// `existing_blocked_domains`, which isn't reflected in `EnrollResponse`
+/// at all.
+async fn enroll_handler_capturing(
+    State((ca, captured)): State<(Arc<Ca>, Arc<Mutex<Option<EnrollRequest>>>)>,
+    Json(req): Json<EnrollRequest>,
+) -> Response {
+    *captured.lock().unwrap() = Some(req.clone());
+    if req.token != EXPECTED_TOKEN {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let issued = ca
+        .sign_agent_csr(&req.csr_pem, &[req.hostname.clone(), "127.0.0.1".to_string()])
+        .unwrap();
+    Json(EnrollResponse {
+        cert_pem: issued.cert_pem,
+        ca_cert_pem: ca.cert_pem().to_string(),
+        agent_id: "enrolled-agent-id".to_string(),
+        initial_policy: Policy {
+            version: 1,
+            timezone: "UTC".into(),
+            rules: vec![],
+            exceptions: vec![],
+            protection: Protection::default(),
+        },
+    })
+    .into_response()
+}
+
+async fn spawn_capturing_enrollment_server(ca: Arc<Ca>, captured: Arc<Mutex<Option<EnrollRequest>>>) -> SocketAddr {
+    let server_identity = ca.issue_server_identity(&["127.0.0.1".to_string()]).unwrap();
+    let chain_pem = format!("{}\n{}", server_identity.cert_pem, ca.cert_pem());
+    let tls_config =
+        homeguard_common::server_config_tls_no_client_auth(&chain_pem, &server_identity.key_pem).unwrap();
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
+
+    let router = Router::new()
+        .route("/v1/enroll", post(enroll_handler_capturing))
+        .with_state((ca, captured));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum_server::from_tcp_rustls(listener, rustls_config)
+            .serve(router.into_make_service())
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    addr
+}
+
 async fn spawn_enrollment_server(ca: Arc<Ca>) -> SocketAddr {
     let server_identity = ca
         .issue_server_identity(&["127.0.0.1".to_string()])
@@ -103,6 +156,7 @@ async fn enroll_rejects_wrong_token() {
 
     let result = homeguard_agent::enroll::enroll(
         &paths,
+        &data_dir.path().join("hosts"),
         &format!("https://{addr}/v1/enroll"),
         "wrong-token",
         &ca.fingerprint_sha256(),
@@ -128,6 +182,7 @@ async fn enroll_rejects_wrong_ca_pin() {
 
     let result = homeguard_agent::enroll::enroll(
         &paths,
+        &data_dir.path().join("hosts"),
         &format!("https://{addr}/v1/enroll"),
         EXPECTED_TOKEN,
         &wrong_ca.fingerprint_sha256(),
@@ -151,6 +206,7 @@ async fn enroll_rejects_a_ca_cert_in_the_body_that_does_not_match_the_pin() {
     // response body's ca_cert_pem is a different CA entirely.
     let result = homeguard_agent::enroll::enroll(
         &paths,
+        &data_dir.path().join("hosts"),
         &format!("https://{addr}/v1/enroll-lying"),
         EXPECTED_TOKEN,
         &ca.fingerprint_sha256(),
@@ -176,6 +232,7 @@ async fn enroll_succeeds_and_persists_a_usable_identity() {
 
     let enrolled = homeguard_agent::enroll::enroll(
         &paths,
+        &data_dir.path().join("hosts"),
         &format!("https://{addr}/v1/enroll"),
         EXPECTED_TOKEN,
         &ca.fingerprint_sha256(),
@@ -193,4 +250,38 @@ async fn enroll_succeeds_and_persists_a_usable_identity() {
     // The identity must build a valid server TLS config (i.e. the issued
     // cert + locally-kept key are actually a matching pair).
     identity.server_tls_config().unwrap();
+}
+
+#[tokio::test]
+async fn enroll_reports_domains_already_blocked_by_a_legacy_or_current_hosts_block() {
+    homeguard_common::install_crypto_provider();
+    let ca = Arc::new(Ca::generate().unwrap());
+    let captured: Arc<Mutex<Option<EnrollRequest>>> = Arc::new(Mutex::new(None));
+    let addr = spawn_capturing_enrollment_server(ca.clone(), captured.clone()).await;
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let paths = homeguard_agent::config::AgentPaths::new(data_dir.path());
+    paths.ensure_created().unwrap();
+
+    // A poste that still carries a pre-rewrite SiteBlocker block, sitting
+    // next to unrelated hosts entries this must leave alone.
+    let hosts_path = data_dir.path().join("hosts");
+    std::fs::write(
+        &hosts_path,
+        "127.0.0.1 localhost\n\n# BEGIN SITEBLOCKER\n0.0.0.0 old-tracked-site.com\n# END SITEBLOCKER\n",
+    )
+    .unwrap();
+
+    homeguard_agent::enroll::enroll(
+        &paths,
+        &hosts_path,
+        &format!("https://{addr}/v1/enroll"),
+        EXPECTED_TOKEN,
+        &ca.fingerprint_sha256(),
+    )
+    .await
+    .unwrap();
+
+    let received = captured.lock().unwrap().take().expect("server should have received a request");
+    assert_eq!(received.existing_blocked_domains, vec!["old-tracked-site.com".to_string()]);
 }

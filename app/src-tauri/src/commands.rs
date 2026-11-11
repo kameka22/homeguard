@@ -34,6 +34,19 @@ pub fn set_agent_display_name(state: State<'_, AppState>, agent_id: String, disp
     state.db.set_agent_display_name(&agent_id, &display_name).map_err(err)
 }
 
+#[tauri::command]
+pub fn set_agent_tags(state: State<'_, AppState>, agent_id: String, tags: Vec<String>) -> CmdResult<()> {
+    state.db.set_agent_tags(&agent_id, &tags).map_err(err)
+}
+
+/// Dismisses the "domaines déjà bloqués détectés" banner — called once
+/// the admin has reviewed them, whether they were folded into a list or
+/// just ignored.
+#[tauri::command]
+pub fn clear_agent_pending_discovered_domains(state: State<'_, AppState>, agent_id: String) -> CmdResult<()> {
+    state.db.clear_agent_pending_discovered_domains(&agent_id).map_err(err)
+}
+
 /// Marks the agent revoked (the app will refuse to connect to it from now
 /// on) and tells the agent itself to restore its hosts file, lift its
 /// browser policies and uninstall — best-effort: if it's offline, the
@@ -556,6 +569,64 @@ pub fn update_list_domains(state: State<'_, AppState>, list_id: String, domains:
 #[tauri::command]
 pub fn delete_list(state: State<'_, AppState>, list_id: String) -> CmdResult<()> {
     state.db.delete_list(&list_id).map_err(err)
+}
+
+#[tauri::command]
+pub fn set_list_color(state: State<'_, AppState>, list_id: String, color: String) -> CmdResult<()> {
+    state.db.set_list_color(&list_id, &color).map_err(err)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VariantInfo {
+    pub domain: String,
+    pub excluded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DomainVariants {
+    pub base_domain: String,
+    pub variants: Vec<VariantInfo>,
+}
+
+/// For each of a list's domains, every catalog/`www.` variant it expands
+/// to and whether the admin has excluded it — what the list detail
+/// screen's variant chips (× to exclude, ↺ to restore) render from.
+#[tauri::command]
+pub fn list_domain_variants(state: State<'_, AppState>, list_id: String) -> CmdResult<Vec<DomainVariants>> {
+    let list = state.db.get_list(&list_id).map_err(err)?.ok_or_else(|| "liste inconnue".to_string())?;
+    let catalog = state.db.list_aliases().map_err(err)?;
+    let auto_www = state.auto_www();
+
+    let mut out = Vec::with_capacity(list.domains.len());
+    for base_domain in &list.domains {
+        let mut variants: Vec<String> = Vec::new();
+        if auto_www && !base_domain.starts_with("www.") {
+            variants.push(format!("www.{base_domain}"));
+        }
+        if let Some(entry) = catalog.iter().find(|e| &e.base_domain == base_domain) {
+            for v in &entry.variants {
+                if !variants.contains(v) {
+                    variants.push(v.clone());
+                }
+            }
+        }
+        out.push(DomainVariants {
+            base_domain: base_domain.clone(),
+            variants: variants
+                .into_iter()
+                .map(|domain| {
+                    let excluded = list.excluded_variants.contains(&domain);
+                    VariantInfo { domain, excluded }
+                })
+                .collect(),
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn set_list_excluded_variants(state: State<'_, AppState>, list_id: String, excluded_variants: Vec<String>) -> CmdResult<()> {
+    state.db.set_list_excluded_variants(&list_id, &excluded_variants).map_err(err)
 }
 
 // --- assignments & exceptions ------------------------------------------

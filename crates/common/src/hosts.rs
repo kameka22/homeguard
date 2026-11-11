@@ -6,6 +6,14 @@
 
 pub const BEGIN_MARKER: &str = "# BEGIN HOMEGUARD";
 pub const END_MARKER: &str = "# END HOMEGUARD";
+/// Markers written by the agent before its full rewrite (the app was
+/// still called "SiteBlocker" then). No longer written by anything, but
+/// still recognized two ways: `apply_block` strips a leftover block on
+/// sight instead of leaving it to linger forever next to the current one,
+/// and `extract_legacy_or_current_domains` reports what's in it so
+/// enrollment can surface pre-existing rules back to the app.
+const LEGACY_BEGIN_MARKER: &str = "# BEGIN SITEBLOCKER";
+const LEGACY_END_MARKER: &str = "# END SITEBLOCKER";
 const CONFLICT_PREFIX: &str = "# [homeguard] désactivé: ";
 const BLOCK_IP: &str = "0.0.0.0";
 
@@ -102,32 +110,56 @@ pub fn apply_block(original: &str, domains: &[String]) -> ApplyResult {
 /// Extract the list of domains currently present in the managed block, if
 /// any. Returns `None` when no (or a corrupted) block is found.
 pub fn extract_block(content: &str) -> Option<Vec<String>> {
-    let raw_lines = split_lines(content);
-    let begin_idx = raw_lines.iter().position(|l| l.trim() == BEGIN_MARKER)?;
+    extract_domains_between(&split_lines(content), BEGIN_MARKER, END_MARKER)
+}
+
+/// Domains found in either the current managed block or a leftover block
+/// from before the agent's full rewrite (`# BEGIN SITEBLOCKER` …) — not
+/// used by `apply_block` (which always just writes whatever the caller
+/// passes it), only by enrollment, to report pre-existing rules back to
+/// the app before anything's actually been pushed to this poste yet. When
+/// both are present the two sets are merged.
+pub fn extract_legacy_or_current_domains(content: &str) -> Vec<String> {
+    let lines = split_lines(content);
+    let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Some(domains) = extract_domains_between(&lines, BEGIN_MARKER, END_MARKER) {
+        found.extend(domains);
+    }
+    if let Some(domains) = extract_domains_between(&lines, LEGACY_BEGIN_MARKER, LEGACY_END_MARKER) {
+        found.extend(domains);
+    }
+    found.into_iter().collect()
+}
+
+/// Shared by [`extract_block`] and [`extract_legacy_or_current_domains`]:
+/// the domains listed between one marker pair, or `None` if that pair
+/// isn't found (or is corrupted — `BEGIN` without a matching `END`).
+fn extract_domains_between(raw_lines: &[&str], begin_marker: &str, end_marker: &str) -> Option<Vec<String>> {
+    let begin_idx = raw_lines.iter().position(|l| l.trim() == begin_marker)?;
     let end_idx = raw_lines[begin_idx..]
         .iter()
-        .position(|l| l.trim() == END_MARKER)
+        .position(|l| l.trim() == end_marker)
         .map(|rel| begin_idx + rel)?;
 
-    let domains = raw_lines[begin_idx + 1..end_idx]
-        .iter()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                return None;
-            }
-            let mut parts = line.split_whitespace();
-            let ip = parts.next()?;
-            let host = parts.next()?;
-            if ip == BLOCK_IP {
-                Some(host.to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    Some(domains)
+    Some(
+        raw_lines[begin_idx + 1..end_idx]
+            .iter()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                let mut parts = line.split_whitespace();
+                let ip = parts.next()?;
+                let host = parts.next()?;
+                if ip == BLOCK_IP {
+                    Some(host.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
 }
 
 fn render_block_lines(domains: &[String]) -> Vec<String> {
@@ -148,24 +180,47 @@ fn render_block_lines(domains: &[String]) -> Vec<String> {
 }
 
 /// Split `raw_lines` into (lines before the block, lines after the block,
-/// whether a block was found). When a `BEGIN` marker is found without a
-/// matching `END` (corrupted block), everything from `BEGIN` to the end of
-/// the file is treated as part of the (discarded) block.
+/// whether the *current* block was found) — after first dropping a legacy
+/// `SITEBLOCKER` block entirely, if one is present (see
+/// [`LEGACY_BEGIN_MARKER`]): it's never kept or rewritten, just removed,
+/// so a poste still carrying one gets it cleaned up on its very next
+/// sync. When a `BEGIN` marker (either one) is found without a matching
+/// `END` (corrupted block), everything from `BEGIN` to the end of the
+/// file is treated as part of the (discarded) block.
 fn split_around_block<'a>(raw_lines: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>, bool) {
-    let Some(begin_idx) = raw_lines.iter().position(|l| l.trim() == BEGIN_MARKER) else {
-        return (raw_lines.to_vec(), Vec::new(), false);
+    let without_legacy = strip_marker_block(raw_lines, LEGACY_BEGIN_MARKER, LEGACY_END_MARKER);
+
+    let Some(begin_idx) = without_legacy.iter().position(|l| l.trim() == BEGIN_MARKER) else {
+        return (without_legacy, Vec::new(), false);
     };
-    let end_idx = raw_lines[begin_idx..]
+    let end_idx = without_legacy[begin_idx..]
         .iter()
         .position(|l| l.trim() == END_MARKER)
         .map(|rel| begin_idx + rel);
 
-    let before = raw_lines[..begin_idx].to_vec();
+    let before = without_legacy[..begin_idx].to_vec();
     let after = match end_idx {
-        Some(end_idx) => raw_lines[end_idx + 1..].to_vec(),
+        Some(end_idx) => without_legacy[end_idx + 1..].to_vec(),
         None => Vec::new(),
     };
     (before, after, true)
+}
+
+/// Removes the block delimited by `begin_marker`/`end_marker` from
+/// `lines` entirely (not just locates it) — used to drop a legacy block
+/// up front, before `split_around_block` goes looking for the current
+/// one. A no-op if that marker pair isn't present.
+fn strip_marker_block<'a>(lines: &[&'a str], begin_marker: &str, end_marker: &str) -> Vec<&'a str> {
+    let Some(begin_idx) = lines.iter().position(|l| l.trim() == begin_marker) else {
+        return lines.to_vec();
+    };
+    let end_idx = lines[begin_idx..].iter().position(|l| l.trim() == end_marker).map(|rel| begin_idx + rel);
+
+    let mut out = lines[..begin_idx].to_vec();
+    if let Some(end_idx) = end_idx {
+        out.extend_from_slice(&lines[end_idx + 1..]);
+    }
+    out
 }
 
 /// If `line` is an active (non-comment) hosts entry that names one of the
@@ -384,5 +439,61 @@ mod tests {
     #[test]
     fn normalizes_domain_case_and_trailing_dot() {
         assert_eq!(normalize_domain("YouTube.com."), "youtube.com");
+    }
+
+    #[test]
+    fn apply_block_removes_a_legacy_only_block_and_writes_the_current_one() {
+        let original = "127.0.0.1 localhost\n\n# BEGIN SITEBLOCKER\n0.0.0.0 old-from-siteblocker.com\n# END SITEBLOCKER\n";
+        let result = apply_block(original, &domains(&["new.com"]));
+        assert_eq!(
+            result.content,
+            "127.0.0.1 localhost\n\n# BEGIN HOMEGUARD\n0.0.0.0 new.com\n# END HOMEGUARD\n"
+        );
+        assert!(!result.content.contains("SITEBLOCKER"));
+        assert!(!result.content.contains("old-from-siteblocker.com"));
+    }
+
+    #[test]
+    fn apply_block_removes_a_legacy_block_coexisting_with_a_current_one() {
+        let original = "# BEGIN SITEBLOCKER\n0.0.0.0 legacy.com\n# END SITEBLOCKER\n\n# BEGIN HOMEGUARD\n0.0.0.0 old-current.com\n# END HOMEGUARD\n";
+        let result = apply_block(original, &domains(&["new.com"]));
+        assert_eq!(result.content, "\n# BEGIN HOMEGUARD\n0.0.0.0 new.com\n# END HOMEGUARD\n");
+    }
+
+    #[test]
+    fn apply_block_drops_a_corrupted_legacy_block_to_eof() {
+        // BEGIN SITEBLOCKER present but its END marker missing: everything
+        // from there to EOF is discarded, same corrupted-block handling as
+        // the current marker pair already gets.
+        let original = "127.0.0.1 localhost\n\n# BEGIN SITEBLOCKER\n0.0.0.0 old.com\n";
+        let result = apply_block(original, &domains(&["new.com"]));
+        assert_eq!(
+            result.content,
+            "127.0.0.1 localhost\n\n# BEGIN HOMEGUARD\n0.0.0.0 new.com\n# END HOMEGUARD\n"
+        );
+    }
+
+    #[test]
+    fn extract_legacy_or_current_domains_reads_a_legacy_only_block() {
+        let content = "127.0.0.1 localhost\n\n# BEGIN SITEBLOCKER\n0.0.0.0 old1.com\n0.0.0.0 old2.com\n# END SITEBLOCKER\n";
+        assert_eq!(extract_legacy_or_current_domains(content), domains(&["old1.com", "old2.com"]));
+    }
+
+    #[test]
+    fn extract_legacy_or_current_domains_reads_a_current_only_block() {
+        let content = "# BEGIN HOMEGUARD\n0.0.0.0 a.com\n# END HOMEGUARD\n";
+        assert_eq!(extract_legacy_or_current_domains(content), domains(&["a.com"]));
+    }
+
+    #[test]
+    fn extract_legacy_or_current_domains_merges_both_when_present() {
+        let content = "# BEGIN SITEBLOCKER\n0.0.0.0 old.com\n# END SITEBLOCKER\n# BEGIN HOMEGUARD\n0.0.0.0 new.com\n# END HOMEGUARD\n";
+        assert_eq!(extract_legacy_or_current_domains(content), domains(&["new.com", "old.com"]));
+    }
+
+    #[test]
+    fn extract_legacy_or_current_domains_is_empty_without_either_block() {
+        let content = "127.0.0.1 localhost\n";
+        assert!(extract_legacy_or_current_domains(content).is_empty());
     }
 }

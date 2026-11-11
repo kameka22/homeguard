@@ -5,7 +5,8 @@
   import ConfirmDialog from "../ConfirmDialog.svelte";
   import AssignListDialog from "../AssignListDialog.svelte";
   import ScheduleDialog from "../ScheduleDialog.svelte";
-  import { listColor } from "../colors.js";
+  import SuggestionsDialog from "../SuggestionsDialog.svelte";
+  import { listColor, LIST_COLOR_PALETTE } from "../colors.js";
 
   export let listId;
   export let refreshToken = 0;
@@ -21,26 +22,46 @@
   let agents = [];
   let groups = [];
   let usedBy = [];
+  let domainVariants = [];
   let newDomainText = "";
   let domainFilter = "";
   let error = "";
   let confirmDelete = false;
   let showAssign = false;
+  let showSuggestions = false;
   let editingAssignment = null;
 
   async function load() {
     error = "";
     try {
-      const [lists, a, g, asn] = await Promise.all([
-        api.listLists(), api.listAgents(), api.listGroups(), api.listAssignments(),
+      const [lists, a, g, asn, dv] = await Promise.all([
+        api.listLists(), api.listAgents(), api.listGroups(), api.listAssignments(), api.listDomainVariants(listId),
       ]);
       list = lists.find((l) => l.id === listId) ?? null;
       agents = a;
       groups = g;
       usedBy = asn.filter((x) => x.list_id === listId);
+      domainVariants = dv;
     } catch (e) {
       error = String(e);
     }
+  }
+
+  async function setColor(color) {
+    try {
+      await api.setListColor(listId, color);
+      await load();
+    } catch (e) { error = String(e); }
+  }
+
+  async function excludeVariant(domain) {
+    const next = [...new Set([...(list?.excluded_variants ?? []), domain])];
+    try { await api.setListExcludedVariants(listId, next); await load(); } catch (e) { error = String(e); }
+  }
+
+  async function restoreVariant(domain) {
+    const next = (list?.excluded_variants ?? []).filter((d) => d !== domain);
+    try { await api.setListExcludedVariants(listId, next); await load(); } catch (e) { error = String(e); }
   }
 
   function targetName(a) {
@@ -99,14 +120,19 @@
     await load();
   }
 
-  $: visibleDomains = list ? list.domains.filter((d) => d.includes(domainFilter.trim().toLowerCase())) : [];
+  async function suggestionsDone() {
+    showSuggestions = false;
+    await load();
+  }
+
+  $: visibleDomainVariants = domainVariants.filter((dv) => dv.base_domain.includes(domainFilter.trim().toLowerCase()));
 
   $: listId, load();
   $: refreshToken, load();
 </script>
 
 <div class="toolbar">
-  {#if list}<span class="swatch" style="background:{listColor(list.id)}; width:11px; height:11px;"></span>{/if}
+  {#if list}<span class="swatch" style="background:{listColor(list)}; width:11px; height:11px;"></span>{/if}
   <span class="section-title">{list?.name ?? "…"}</span>
   <div class="spacer"></div>
 </div>
@@ -115,32 +141,54 @@
   {#if error}<p class="error">{error}</p>{/if}
 
   {#if list}
-    <p class="subtitle" style="margin:0 0 var(--space-4);">
+    <p class="subtitle" style="margin:0 0 var(--space-2);">
       {list.domains.length} domaine(s) · utilisée par {usedBy.length} cible(s)
     </p>
+
+    <div class="row" style="gap:6px; margin:0 0 var(--space-4);">
+      <span class="subtitle">Couleur</span>
+      {#each LIST_COLOR_PALETTE as c}
+        <button
+          class="color-swatch-btn"
+          class:selected={listColor(list) === c}
+          style="background:{c};"
+          on:click={() => setColor(c)}
+          aria-label="Couleur {c}"
+        ></button>
+      {/each}
+    </div>
 
     <div class="group">
       <div class="row-line">
         <span style="flex:1; font-weight:650; font-size:var(--text-sm);">Domaines</span>
+        {#if domainVariants.length > 0}<span class="subtitle">Cliquez × sur une variante pour l'exclure</span>{/if}
         {#if list.domains.length > 6}
           <input placeholder="Filtrer…" bind:value={domainFilter} style="width:140px;" />
         {/if}
       </div>
       {#if list.domains.length === 0}
         <div class="row-line"><span class="subtitle">Aucun domaine — ajoutez-en un ou plusieurs ci-dessous.</span></div>
-      {:else if visibleDomains.length === 0}
+      {:else if visibleDomainVariants.length === 0}
         <div class="row-line"><span class="subtitle">Aucun domaine ne correspond à « {domainFilter} ».</span></div>
       {:else}
-        <div class="row-line" style="flex-wrap:wrap;">
-          <div class="chip-row">
-            {#each visibleDomains as domain}
-              <span class="chip">
-                {domain}
-                <button on:click={() => removeDomain(domain)} aria-label="Retirer {domain}"><Icon name="x" /></button>
-              </span>
-            {/each}
+        {#each visibleDomainVariants as dv}
+          <div class="row-line" style="flex-wrap:wrap; gap:6px;">
+            <span class="mono" style="font-weight:600; width:150px; flex-shrink:0;">{dv.base_domain}</span>
+            <div class="chip-row" style="flex:1;">
+              {#each dv.variants as v}
+                <span class="chip" class:excluded={v.excluded}>
+                  {v.domain}
+                  {#if v.excluded}
+                    <button on:click={() => restoreVariant(v.domain)} aria-label="Réintégrer {v.domain}"><Icon name="refresh" /></button>
+                  {:else}
+                    <button on:click={() => excludeVariant(v.domain)} aria-label="Exclure {v.domain}"><Icon name="x" /></button>
+                  {/if}
+                </span>
+              {/each}
+            </div>
+            <button class="toolbar-icon-btn" on:click={() => removeDomain(dv.base_domain)} aria-label="Retirer {dv.base_domain}"><Icon name="x" /></button>
           </div>
-        </div>
+        {/each}
       {/if}
       <div class="row-line" style="flex-direction:column; align-items:stretch; gap:var(--space-2);">
         <textarea
@@ -153,6 +201,7 @@
           <p class="subtitle" style="margin:0; flex:1;">
             http(s)://, chemins et doublons sont retirés automatiquement. Les variantes connues sont ajoutées.
           </p>
+          <button on:click={() => (showSuggestions = true)}>Suggestions…</button>
           <button class="tbtn primary" on:click={addDomains} disabled={!newDomainText.trim()}>Ajouter</button>
         </div>
       </div>
@@ -213,5 +262,14 @@
     initialSchedule={editingAssignment.schedule}
     on:close={() => (editingAssignment = null)}
     on:saved={scheduleSaved}
+  />
+{/if}
+
+{#if showSuggestions}
+  <SuggestionsDialog
+    listId={listId}
+    existingDomains={list.domains}
+    on:close={() => (showSuggestions = false)}
+    on:done={suggestionsDone}
   />
 {/if}

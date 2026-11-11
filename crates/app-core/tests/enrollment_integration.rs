@@ -26,7 +26,13 @@ async fn spawn_enrollment_server(state: Arc<EnrollmentState>) -> (SocketAddr, ax
     (addr, handle)
 }
 
-async fn enroll_via_http(addr: SocketAddr, token: &str, ca_fingerprint: &str, hostname: &str) -> Result<EnrollResponse, reqwest::StatusCode> {
+async fn enroll_via_http(
+    addr: SocketAddr,
+    token: &str,
+    ca_fingerprint: &str,
+    hostname: &str,
+    existing_blocked_domains: Vec<String>,
+) -> Result<EnrollResponse, reqwest::StatusCode> {
     homeguard_common::install_crypto_provider();
     let (_key_pair, csr_pem) = homeguard_common::generate_agent_identity(&[hostname.to_string()]).unwrap();
     let tls_config = homeguard_common::client_config_pinned_ca(ca_fingerprint);
@@ -44,6 +50,7 @@ async fn enroll_via_http(addr: SocketAddr, token: &str, ca_fingerprint: &str, ho
             os: "linux".to_string(),
             arch: "x86_64".to_string(),
             agent_version: "0.1.0-test".to_string(),
+            existing_blocked_domains,
         })
         .send()
         .await
@@ -69,7 +76,7 @@ async fn enrolling_creates_the_agent_and_returns_its_resolved_initial_policy() {
     let token = state.issue_token(jiff::SignedDuration::from_secs(1800), Some(group_id.clone()));
     let (addr, handle) = spawn_enrollment_server(state).await;
 
-    let enrolled = enroll_via_http(addr, &token, &ca.fingerprint_sha256(), "PORTABLE-LEO")
+    let enrolled = enroll_via_http(addr, &token, &ca.fingerprint_sha256(), "PORTABLE-LEO", Vec::new())
         .await
         .expect("enrollment should succeed with a valid token and CA pin");
 
@@ -104,16 +111,59 @@ async fn rejects_expired_or_unknown_token() {
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let status = enroll_via_http(addr, &expired_token, &ca.fingerprint_sha256(), "PC-X")
+    let status = enroll_via_http(addr, &expired_token, &ca.fingerprint_sha256(), "PC-X", Vec::new())
         .await
         .expect_err("an expired token must be rejected");
     assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
 
-    let status = enroll_via_http(addr, "never-issued", &ca.fingerprint_sha256(), "PC-X")
+    let status = enroll_via_http(addr, "never-issued", &ca.fingerprint_sha256(), "PC-X", Vec::new())
         .await
         .expect_err("an unknown token must be rejected");
     assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
 
     assert!(db.list_agents().unwrap().is_empty());
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn surfaces_domains_the_agent_found_already_blocked_at_enrollment() {
+    let ca = Arc::new(Ca::generate().unwrap());
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let state = Arc::new(EnrollmentState::new(ca.clone(), db.clone(), "UTC"));
+    let token = state.issue_token(jiff::SignedDuration::from_secs(1800), None);
+    let (addr, handle) = spawn_enrollment_server(state).await;
+
+    let existing = vec!["old-tracked-site.com".to_string(), "another-old-one.com".to_string()];
+    let enrolled = enroll_via_http(addr, &token, &ca.fingerprint_sha256(), "PC-SALON", existing.clone())
+        .await
+        .expect("enrollment should still succeed");
+
+    let agent = db.get_agent(&enrolled.agent_id).unwrap().unwrap();
+    assert_eq!(agent.pending_discovered_domains, existing);
+
+    let history = db.recent_history(10).unwrap();
+    assert!(history.iter().any(|h| h.kind == "existing_domains_detected"));
+
+    handle.shutdown();
+}
+
+#[tokio::test]
+async fn does_not_touch_pending_discovered_domains_when_none_were_reported() {
+    let ca = Arc::new(Ca::generate().unwrap());
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    let state = Arc::new(EnrollmentState::new(ca.clone(), db.clone(), "UTC"));
+    let token = state.issue_token(jiff::SignedDuration::from_secs(1800), None);
+    let (addr, handle) = spawn_enrollment_server(state).await;
+
+    let enrolled = enroll_via_http(addr, &token, &ca.fingerprint_sha256(), "PC-SALON", Vec::new())
+        .await
+        .expect("enrollment should succeed");
+
+    let agent = db.get_agent(&enrolled.agent_id).unwrap().unwrap();
+    assert!(agent.pending_discovered_domains.is_empty());
+
+    let history = db.recent_history(10).unwrap();
+    assert!(!history.iter().any(|h| h.kind == "existing_domains_detected"));
+
     handle.shutdown();
 }

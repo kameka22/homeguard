@@ -2,6 +2,7 @@ mod app_identity;
 mod commands;
 #[cfg(target_os = "macos")]
 mod keychain_ca_store;
+mod menu;
 mod net;
 mod state;
 
@@ -14,6 +15,8 @@ pub fn run() {
     tracing_subscriber::fmt::init();
 
     tauri::Builder::default()
+        .menu(|app| menu::build(app))
+        .on_menu_event(menu::handle_event)
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let state = AppState::init(&data_dir)?;
@@ -23,6 +26,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_agents,
             commands::set_agent_display_name,
+            commands::set_agent_tags,
+            commands::clear_agent_pending_discovered_domains,
             commands::remove_agent,
             commands::discover_agents,
             commands::discover_and_sync_all,
@@ -41,6 +46,9 @@ pub fn run() {
             commands::create_list,
             commands::update_list_domains,
             commands::delete_list,
+            commands::set_list_color,
+            commands::list_domain_variants,
+            commands::set_list_excluded_variants,
             commands::assignments_for,
             commands::list_assignments,
             commands::list_exceptions,

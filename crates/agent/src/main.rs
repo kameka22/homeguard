@@ -38,6 +38,8 @@ enum Command {
         ca_sha256: String,
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        #[arg(long)]
+        hosts_path: Option<PathBuf>,
     },
     /// Register the OS service so the agent starts on boot for every
     /// session (must already be enrolled).
@@ -93,10 +95,12 @@ async fn main() -> anyhow::Result<()> {
             token,
             ca_sha256,
             data_dir,
+            hosts_path,
         } => {
             let paths = data_dir.map(AgentPaths::new).unwrap_or_else(AgentPaths::default_for_os);
             paths.ensure_created()?;
-            let enrolled = enroll::enroll(&paths, &url, &token, &ca_sha256).await?;
+            let hosts_path = hosts_path.unwrap_or_else(AgentPaths::system_hosts_path);
+            let enrolled = enroll::enroll(&paths, &hosts_path, &url, &token, &ca_sha256).await?;
             println!("Enrôlé avec succès. agent_id = {}", enrolled.agent_id);
             Ok(())
         }

@@ -17,7 +17,17 @@ pub fn announce(
     let daemon = ServiceDaemon::new()?;
 
     let instance_name = format!("{hostname}-{}", &agent_id[..agent_id.len().min(8)]);
-    let host_name = format!("{hostname}.local.");
+    // Idempotent: on some systems the OS hostname already ends in
+    // `.local` (some Linux mDNS/Avahi setups report it that way) —
+    // appending it unconditionally would announce `foo.local.local.`,
+    // which the app would then fail to connect to (see
+    // `app_core::client::stable_agent_name`, which has the same guard for
+    // the same reason).
+    let host_name = if hostname.to_ascii_lowercase().ends_with(".local") {
+        format!("{hostname}.")
+    } else {
+        format!("{hostname}.local.")
+    };
 
     let mut properties = std::collections::HashMap::new();
     properties.insert("id".to_string(), agent_id.to_string());

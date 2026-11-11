@@ -6,6 +6,8 @@ import { invoke } from "@tauri-apps/api/core";
 export const api = {
   listAgents: () => invoke("list_agents"),
   setAgentDisplayName: (agentId, displayName) => invoke("set_agent_display_name", { agentId, displayName }),
+  setAgentTags: (agentId, tags) => invoke("set_agent_tags", { agentId, tags }),
+  clearAgentPendingDiscoveredDomains: (agentId) => invoke("clear_agent_pending_discovered_domains", { agentId }),
   removeAgent: (agentId, addr) => invoke("remove_agent", { agentId, addr }),
   discoverAgents: (timeoutMs = 3000) => invoke("discover_agents", { timeoutMs }),
   discoverAndSyncAll: (timeoutMs = 3000) => invoke("discover_and_sync_all", { timeoutMs }),
@@ -26,6 +28,9 @@ export const api = {
   createList: (name, domains) => invoke("create_list", { name, domains }),
   updateListDomains: (listId, domains) => invoke("update_list_domains", { listId, domains }),
   deleteList: (listId) => invoke("delete_list", { listId }),
+  setListColor: (listId, color) => invoke("set_list_color", { listId, color }),
+  listDomainVariants: (listId) => invoke("list_domain_variants", { listId }),
+  setListExcludedVariants: (listId, excludedVariants) => invoke("set_list_excluded_variants", { listId, excludedVariants }),
 
   assignmentsFor: (agentId) => invoke("assignments_for", { agentId }),
   listAssignments: () => invoke("list_assignments"),

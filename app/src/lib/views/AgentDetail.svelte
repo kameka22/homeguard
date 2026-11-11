@@ -4,6 +4,7 @@
   import Icon from "../Icon.svelte";
   import ConfirmDialog from "../ConfirmDialog.svelte";
   import UnblockDialog from "../UnblockDialog.svelte";
+  import DiscoveredDomainsDialog from "../DiscoveredDomainsDialog.svelte";
   import { autofocus } from "../actions.js";
 
   export let agentId;
@@ -23,6 +24,8 @@
   let exceptions = [];
   let memberGroupIds = [];
   let addingGroupId = "";
+  let addingTag = false;
+  let newTag = "";
   let bundledVersion = null;
   let online = null; // null = checking, true/false once known
   let error = "";
@@ -34,6 +37,7 @@
   let renaming = false;
   let renameValue = "";
   let showUnblock = false;
+  let showDiscovered = false;
 
   let newAssignmentListId = "";
   let scheduleMode = "always";
@@ -205,8 +209,31 @@
     await load();
   }
 
+  async function discoveredDone() {
+    showDiscovered = false;
+    await load();
+  }
+
   async function removeException(id) {
     try { await api.deleteException(id); await load(); } catch (e) { error = String(e); }
+  }
+
+  async function commitTag() {
+    const tag = newTag.trim();
+    addingTag = false;
+    newTag = "";
+    if (!tag || agent.tags.includes(tag)) return;
+    try {
+      await api.setAgentTags(agentId, [...agent.tags, tag]);
+      await load();
+    } catch (e) { error = String(e); }
+  }
+
+  async function removeTag(tag) {
+    try {
+      await api.setAgentTags(agentId, agent.tags.filter((t) => t !== tag));
+      await load();
+    } catch (e) { error = String(e); }
   }
 
   $: isOutdated = bundledVersion && agent?.agent_version && agent.agent_version !== "unknown" && agent.agent_version !== bundledVersion;
@@ -285,6 +312,16 @@
       </div>
     {/if}
 
+    {#if agent.pending_discovered_domains.length > 0}
+      <div class="row-line" style="background:var(--warn-weak); border-radius:var(--radius-md); border-top:none; margin-bottom:var(--space-4);">
+        <Icon name="warning" style="color:var(--warn);" />
+        <span style="flex:1; font-size:var(--text-sm);">
+          {agent.pending_discovered_domains.length} domaine{agent.pending_discovered_domains.length > 1 ? "s" : ""} déjà bloqué{agent.pending_discovered_domains.length > 1 ? "s" : ""} détecté{agent.pending_discovered_domains.length > 1 ? "s" : ""} avant l'enrôlement
+        </span>
+        <button class="tbtn primary" on:click={() => (showDiscovered = true)}>Revoir…</button>
+      </div>
+    {/if}
+
     <div class="group">
       <div class="group-title">Listes bloquées</div>
       {#if assignments.length === 0}
@@ -337,28 +374,47 @@
     </div>
 
     <div class="group">
-      <div class="group-title">Groupes</div>
-      <div class="row-line" style="flex-wrap:wrap;">
-        {#if memberGroups.length === 0}
-          <span class="subtitle">Ce poste n'appartient à aucun groupe.</span>
-        {:else}
+      <div class="group-title">Groupes et étiquettes</div>
+      <div class="row-line">
+        <span class="subtitle" style="width:80px; flex-shrink:0;">Groupes</span>
+        <div class="row" style="flex:1; flex-wrap:wrap; gap:6px;">
           {#each memberGroups as g}
             <span class="pill pill-accent">
               {g.name}
               <button class="toolbar-icon-btn" style="width:14px; height:14px; padding:0;" on:click={() => leaveGroup(g.id)} aria-label="Retirer de {g.name}"><Icon name="x" /></button>
             </span>
           {/each}
-        {/if}
-      </div>
-      {#if joinableGroups.length > 0}
-        <div class="row-line">
-          <select bind:value={addingGroupId} style="flex:1;">
-            <option value="">+ Ajouter à un groupe…</option>
-            {#each joinableGroups as g}<option value={g.id}>{g.name}</option>{/each}
-          </select>
-          <button on:click={joinGroup} disabled={!addingGroupId}>Ajouter</button>
+          {#if joinableGroups.length > 0}
+            <select bind:value={addingGroupId} on:change={joinGroup} style="width:130px;">
+              <option value="">+ Ajouter…</option>
+              {#each joinableGroups as g}<option value={g.id}>{g.name}</option>{/each}
+            </select>
+          {/if}
         </div>
-      {/if}
+      </div>
+      <div class="row-line">
+        <span class="subtitle" style="width:80px; flex-shrink:0;">Étiquettes</span>
+        <div class="row" style="flex:1; flex-wrap:wrap; gap:6px;">
+          {#each agent.tags as t}
+            <span class="pill pill-neutral">
+              {t}
+              <button class="toolbar-icon-btn" style="width:14px; height:14px; padding:0;" on:click={() => removeTag(t)} aria-label="Retirer {t}"><Icon name="x" /></button>
+            </span>
+          {/each}
+          {#if addingTag}
+            <input
+              use:autofocus
+              bind:value={newTag}
+              placeholder="ado…"
+              style="width:90px;"
+              on:keydown={(e) => e.key === "Enter" && commitTag()}
+              on:blur={commitTag}
+            />
+          {:else}
+            <button class="toolbar-icon-btn" on:click={() => (addingTag = true)} aria-label="Ajouter une étiquette"><Icon name="plus" /></button>
+          {/if}
+        </div>
+      </div>
     </div>
   {:else if !error}
     <p class="subtitle">Chargement…</p>
@@ -383,5 +439,15 @@
     targetLabel={agent?.display_name || agent?.hostname}
     on:close={() => (showUnblock = false)}
     on:done={unblockDone}
+  />
+{/if}
+
+{#if showDiscovered}
+  <DiscoveredDomainsDialog
+    agentId={agentId}
+    hostname={agent?.display_name || agent?.hostname}
+    domains={agent.pending_discovered_domains}
+    on:close={() => (showDiscovered = false)}
+    on:done={discoveredDone}
   />
 {/if}

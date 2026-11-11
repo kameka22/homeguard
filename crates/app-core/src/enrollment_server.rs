@@ -130,6 +130,20 @@ async fn enroll_handler(
         .db
         .append_history("app", Some(&agent_id), "enrolled", &format!("{} enrôlé depuis {peer_ip}", req.hostname));
 
+    if !req.existing_blocked_domains.is_empty() {
+        let _ = state.db.set_agent_pending_discovered_domains(&agent_id, &req.existing_blocked_domains);
+        let _ = state.db.append_history(
+            "app",
+            Some(&agent_id),
+            "existing_domains_detected",
+            &format!(
+                "{} domaine(s) déjà bloqué(s) détecté(s) sur {} à l'enrôlement",
+                req.existing_blocked_domains.len(),
+                req.hostname
+            ),
+        );
+    }
+
     let policy = match policy_engine::resolve_initial_policy_for_agent(
         &state.db,
         &agent_id,

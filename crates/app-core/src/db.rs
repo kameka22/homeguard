@@ -42,7 +42,14 @@ CREATE TABLE IF NOT EXISTS agents (
     -- Next `seq` to request from this agent's `/v1/events?since=`, so a
     -- sync only pulls what's new since the last one (agents keep their
     -- own journal; nothing is lost if the app was closed in between).
-    events_cursor INTEGER NOT NULL DEFAULT 1
+    events_cursor INTEGER NOT NULL DEFAULT 1,
+    -- Free-form labels the admin assigns ("ado", "salon"...) — distinct
+    -- from groups, which actually carry rules; tags are just organization.
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    -- Domains the agent found already blocked in its hosts file at
+    -- enrollment (current or pre-rewrite marker block) — surfaced once in
+    -- the UI so the admin can fold them into a real list, then cleared.
+    pending_discovered_domains_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS groups (
@@ -59,7 +66,15 @@ CREATE TABLE IF NOT EXISTS group_members (
 CREATE TABLE IF NOT EXISTS lists (
     id           TEXT PRIMARY KEY,
     name         TEXT NOT NULL,
-    domains_json TEXT NOT NULL
+    domains_json TEXT NOT NULL,
+    -- Empty string means "unset" — the UI then falls back to a color
+    -- derived from `id`, so every list still has a stable swatch even
+    -- before anyone's picked one.
+    color        TEXT NOT NULL DEFAULT '',
+    -- Catalog-derived variants (see `aliases.rs`) the admin opted this
+    -- list out of blocking, e.g. keeping `m.roblox.com` reachable while
+    -- still blocking `roblox.com` itself.
+    excluded_variants_json TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS assignments (
@@ -112,6 +127,8 @@ pub struct Agent {
     pub agent_version: Option<String>,
     pub policy_version: u64,
     pub events_cursor: u64,
+    pub tags: Vec<String>,
+    pub pending_discovered_domains: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -125,6 +142,8 @@ pub struct List {
     pub id: String,
     pub name: String,
     pub domains: Vec<String>,
+    pub color: String,
+    pub excluded_variants: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,8 +211,24 @@ fn migrate_add_missing_columns(conn: &Connection) -> Result<()> {
     let columns: &[(&str, &str, &str)] = &[
         ("agents", "events_cursor", "INTEGER NOT NULL DEFAULT 1"),
         ("agents", "arch", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("agents", "tags_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("agents", "pending_discovered_domains_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("lists", "color", "TEXT NOT NULL DEFAULT ''"),
+        ("lists", "excluded_variants_json", "TEXT NOT NULL DEFAULT '[]'"),
     ];
     for (table, column, ddl) in columns {
+        let table_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get(0),
+        )?;
+        if table_exists == 0 {
+            // Nothing to patch — `SCHEMA`'s own `CREATE TABLE IF NOT
+            // EXISTS` (already run before this) handles a table that
+            // doesn't exist yet at all; this loop only ever adds columns
+            // to one that does.
+            continue;
+        }
         let exists: i64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"),
             [],
@@ -284,6 +319,43 @@ impl Db {
             .lock()
             .unwrap()
             .execute("UPDATE agents SET display_name = ?1 WHERE id = ?2", params![display_name, id])?;
+        Ok(())
+    }
+
+    /// Replaces this poste's full tag set — the editor always sends the
+    /// whole list back, same convention as [`Db::update_list_domains`].
+    pub fn set_agent_tags(&self, id: &str, tags: &[String]) -> Result<()> {
+        let tags_json = serde_json::to_string(tags)?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE agents SET tags_json = ?1 WHERE id = ?2", params![tags_json, id])?;
+        Ok(())
+    }
+
+    /// Records what enrollment found already blocked in this poste's
+    /// hosts file (legacy or current marker block) — a no-op (and no
+    /// write at all) when `domains` is empty, so a poste with nothing to
+    /// report doesn't even touch the row.
+    pub fn set_agent_pending_discovered_domains(&self, id: &str, domains: &[String]) -> Result<()> {
+        if domains.is_empty() {
+            return Ok(());
+        }
+        let json = serde_json::to_string(domains)?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE agents SET pending_discovered_domains_json = ?1 WHERE id = ?2", params![json, id])?;
+        Ok(())
+    }
+
+    /// Clears a poste's pending-discovered-domains banner — called once
+    /// the admin has reviewed them (added to a list, or dismissed).
+    pub fn clear_agent_pending_discovered_domains(&self, id: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE agents SET pending_discovered_domains_json = '[]' WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -465,12 +537,17 @@ impl Db {
 
     /// Like [`Db::create_list`], but with an explicit id — used by config
     /// import to preserve ids that `assignments` reference. Upsert.
-    pub fn upsert_list(&self, id: &str, name: &str, domains: &[String]) -> Result<()> {
+    pub fn upsert_list(&self, id: &str, name: &str, domains: &[String], color: &str, excluded_variants: &[String]) -> Result<()> {
         let json = serde_json::to_string(domains)?;
+        let excluded_json = serde_json::to_string(excluded_variants)?;
         self.conn.lock().unwrap().execute(
-            "INSERT INTO lists (id, name, domains_json) VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET name = excluded.name, domains_json = excluded.domains_json",
-            params![id, name, json],
+            "INSERT INTO lists (id, name, domains_json, color, excluded_variants_json) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                domains_json = excluded.domains_json,
+                color = excluded.color,
+                excluded_variants_json = excluded.excluded_variants_json",
+            params![id, name, json, color, excluded_json],
         )?;
         Ok(())
     }
@@ -484,16 +561,37 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_list_color(&self, list_id: &str, color: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE lists SET color = ?1 WHERE id = ?2", params![color, list_id])?;
+        Ok(())
+    }
+
+    /// Replaces this list's full set of excluded catalog variants — what
+    /// clicking × (exclude) or ↺ (restore) on a variant chip sends, same
+    /// "caller computes the whole array" convention as
+    /// [`Db::update_list_domains`].
+    pub fn set_list_excluded_variants(&self, list_id: &str, excluded_variants: &[String]) -> Result<()> {
+        let json = serde_json::to_string(excluded_variants)?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE lists SET excluded_variants_json = ?1 WHERE id = ?2", params![json, list_id])?;
+        Ok(())
+    }
+
     pub fn get_list(&self, id: &str) -> Result<Option<List>> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT id, name, domains_json FROM lists WHERE id = ?1", params![id], row_to_list)
+        conn.query_row("SELECT id, name, domains_json, color, excluded_variants_json FROM lists WHERE id = ?1", params![id], row_to_list)
             .optional()
             .map_err(Into::into)
     }
 
     pub fn list_lists(&self) -> Result<Vec<List>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id, name, domains_json FROM lists ORDER BY name")?;
+        let mut stmt = conn.prepare("SELECT id, name, domains_json, color, excluded_variants_json FROM lists ORDER BY name")?;
         let rows = stmt.query_map([], row_to_list)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
@@ -766,6 +864,10 @@ impl Db {
 }
 
 fn row_to_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
+    let tags_json: String = row.get("tags_json")?;
+    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+    let pending_json: String = row.get("pending_discovered_domains_json")?;
+    let pending_discovered_domains: Vec<String> = serde_json::from_str(&pending_json).unwrap_or_default();
     Ok(Agent {
         id: row.get("id")?,
         display_name: row.get("display_name")?,
@@ -779,16 +881,23 @@ fn row_to_agent(row: &rusqlite::Row) -> rusqlite::Result<Agent> {
         agent_version: row.get("agent_version")?,
         policy_version: row.get::<_, i64>("policy_version")? as u64,
         events_cursor: row.get::<_, i64>("events_cursor")? as u64,
+        tags,
+        pending_discovered_domains,
     })
 }
 
 fn row_to_list(row: &rusqlite::Row) -> rusqlite::Result<List> {
     let domains_json: String = row.get(2)?;
     let domains: Vec<String> = serde_json::from_str(&domains_json).unwrap_or_default();
+    let color: String = row.get(3)?;
+    let excluded_variants_json: String = row.get(4)?;
+    let excluded_variants: Vec<String> = serde_json::from_str(&excluded_variants_json).unwrap_or_default();
     Ok(List {
         id: row.get(0)?,
         name: row.get(1)?,
         domains,
+        color,
+        excluded_variants,
     })
 }
 
@@ -1046,6 +1155,58 @@ mod tests {
         db.delete_list(&list_id).unwrap();
         assert_eq!(db.assignments_for("a1", &[]).unwrap().len(), 0);
         assert!(db.get_list(&list_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_color_and_excluded_variants_default_empty_and_are_editable() {
+        let db = Db::open_in_memory().unwrap();
+        let list_id = db.create_list("Jeux", &["roblox.com".into()]).unwrap();
+
+        let fresh = db.get_list(&list_id).unwrap().unwrap();
+        assert_eq!(fresh.color, "");
+        assert!(fresh.excluded_variants.is_empty());
+
+        db.set_list_color(&list_id, "#e2822a").unwrap();
+        db.set_list_excluded_variants(&list_id, &["m.roblox.com".to_string()]).unwrap();
+
+        let updated = db.get_list(&list_id).unwrap().unwrap();
+        assert_eq!(updated.color, "#e2822a");
+        assert_eq!(updated.excluded_variants, vec!["m.roblox.com".to_string()]);
+    }
+
+    #[test]
+    fn agent_tags_default_empty_and_are_editable() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("a1", "PORTABLE-LEO", "windows", "x86_64", None, None).unwrap();
+        assert!(db.get_agent("a1").unwrap().unwrap().tags.is_empty());
+
+        db.set_agent_tags("a1", &["ado".to_string()]).unwrap();
+        assert_eq!(db.get_agent("a1").unwrap().unwrap().tags, vec!["ado".to_string()]);
+
+        // Re-upserting (a later sync/discovery) must not wipe tags back out.
+        db.upsert_agent("a1", "PORTABLE-LEO", "windows", "x86_64", Some("192.168.1.5"), Some("0.2.0")).unwrap();
+        assert_eq!(db.get_agent("a1").unwrap().unwrap().tags, vec!["ado".to_string()]);
+    }
+
+    #[test]
+    fn pending_discovered_domains_round_trip_and_clear() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("a1", "PORTABLE-LEO", "windows", "x86_64", None, None).unwrap();
+        assert!(db.get_agent("a1").unwrap().unwrap().pending_discovered_domains.is_empty());
+
+        db.set_agent_pending_discovered_domains("a1", &["old1.com".to_string(), "old2.com".to_string()])
+            .unwrap();
+        assert_eq!(
+            db.get_agent("a1").unwrap().unwrap().pending_discovered_domains,
+            vec!["old1.com".to_string(), "old2.com".to_string()]
+        );
+
+        // An empty report is a no-op, not a clear — only `clear_*` clears.
+        db.set_agent_pending_discovered_domains("a1", &[]).unwrap();
+        assert_eq!(db.get_agent("a1").unwrap().unwrap().pending_discovered_domains.len(), 2);
+
+        db.clear_agent_pending_discovered_domains("a1").unwrap();
+        assert!(db.get_agent("a1").unwrap().unwrap().pending_discovered_domains.is_empty());
     }
 
     #[test]

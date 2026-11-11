@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use homeguard_common::wire::{EnrollRequest, EnrollResponse};
 
 use crate::config::AgentPaths;
@@ -36,6 +38,7 @@ pub fn local_hostname() -> String {
 /// start normally.
 pub async fn enroll(
     paths: &AgentPaths,
+    hosts_path: &Path,
     enroll_url: &str,
     token: &str,
     ca_fingerprint_sha256: &str,
@@ -43,6 +46,13 @@ pub async fn enroll(
     let hostname = local_hostname();
     let (key_pair, csr_pem) =
         homeguard_common::generate_agent_identity(std::slice::from_ref(&hostname))?;
+
+    // Best-effort: a poste with no prior block (most of the time), or one
+    // this process can't read yet for whatever reason, just reports none
+    // — it should never be what makes enrollment itself fail.
+    let existing_blocked_domains = std::fs::read_to_string(hosts_path)
+        .map(|content| homeguard_common::extract_legacy_or_current_domains(&content))
+        .unwrap_or_default();
 
     homeguard_common::install_crypto_provider();
     let tls_config = homeguard_common::client_config_pinned_ca(ca_fingerprint_sha256);
@@ -57,6 +67,7 @@ pub async fn enroll(
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        existing_blocked_domains,
     };
 
     let response = client.post(enroll_url).json(&request).send().await?;

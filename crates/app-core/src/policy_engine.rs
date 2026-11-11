@@ -35,10 +35,12 @@ pub fn resolve_policy_for_agent(
         let Some(list) = db.get_list(&assignment.list_id)? else {
             continue;
         };
+        let mut domains = expand_domains(&list.domains, &catalog, auto_www);
+        domains.retain(|d| !list.excluded_variants.contains(d));
         rules.push(Rule {
             id: assignment.id,
             name: list.name,
-            domains: expand_domains(&list.domains, &catalog, auto_www),
+            domains,
             schedule: assignment.schedule,
         });
     }
@@ -107,6 +109,18 @@ mod tests {
         assert!(policy.rules[0].schedule.is_some());
         assert!(policy.protection.self_heal);
         assert!(policy.protection.disable_doh);
+    }
+
+    #[test]
+    fn excluded_variants_are_dropped_from_the_resolved_rule() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("a1", "PORTABLE-LEO", "windows", "x86_64", None, None).unwrap();
+        let games = db.create_list("Jeux", &["roblox.com".to_string()]).unwrap();
+        db.set_list_excluded_variants(&games, &["www.roblox.com".to_string()]).unwrap();
+        db.create_assignment(&games, TargetKind::Agent, "a1", None).unwrap();
+
+        let policy = resolve_policy_for_agent(&db, "a1", 1, "Europe/Paris", true, true, true).unwrap();
+        assert_eq!(policy.rules[0].domains, vec!["roblox.com".to_string()]);
     }
 
     #[test]
