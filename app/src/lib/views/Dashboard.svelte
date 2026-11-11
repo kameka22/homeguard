@@ -2,6 +2,7 @@
   import { onMount, createEventDispatcher } from "svelte";
   import { api } from "../api.js";
   import Icon from "../Icon.svelte";
+  import { remedyFor, reportOutcome, reportRun, syncState } from "../syncFeedback.js";
 
   export let refreshToken = 0;
 
@@ -50,10 +51,11 @@
     }
   }
 
-  async function scan() {
+  async function scan(trigger = "manual") {
     scanning = true;
     try {
       scanResults = await api.discoverAndSyncAll(3000);
+      reportRun(scanResults, { trigger, retry: () => scan() });
       if (await api.getAutoUpdateAgents()) {
         await api.updateAllOutdatedAgents();
       }
@@ -85,7 +87,12 @@
   async function syncOne(agentId) {
     const a = agents.find((x) => x.id === agentId);
     if (!a?.last_ip) return;
-    try { await api.syncAgent(agentId, `${a.last_ip}:7878`); await load(); } catch (e) { loadError = String(e); }
+    try {
+      const outcome = await api.syncAgent(agentId, `${a.last_ip}:7878`);
+      reportOutcome(outcome, () => syncOne(agentId));
+      scanResults = scanResults.map((r) => (r.agent_id === agentId ? outcome : r));
+      await load();
+    } catch (e) { loadError = String(e); }
   }
 
   function goTo(agentId) {
@@ -123,9 +130,25 @@
   $: attentionItems = (() => {
     const items = [];
     for (const r of toHandle) {
+      const remedy = r.ok ? null : remedyFor(r, null);
       items.push({
         agentId: r.agent_id, title: r.hostname, kind: r.ok ? "warn" : "danger",
-        detail: r.detail, actionLabel: "Synchroniser", action: () => syncOne(r.agent_id),
+        detail: r.detail,
+        actionLabel: remedy?.label ?? "Synchroniser",
+        action: remedy?.run ?? (() => syncOne(r.agent_id)),
+      });
+    }
+    // Postes whose last push failed or that haven't received the latest
+    // rules yet (e.g. an automatic push while they were off) — even when
+    // no scan ran this session.
+    for (const a of agents) {
+      if (a.revoked || items.some((i) => i.agentId === a.id)) continue;
+      const st = syncState(a);
+      if (st.kind !== "failed" && st.kind !== "pending") continue;
+      items.push({
+        agentId: a.id, title: a.display_name || a.hostname, kind: st.kind === "failed" ? "danger" : "warn",
+        detail: st.kind === "failed" ? `${st.label} — ${st.detail}` : st.label,
+        actionLabel: "Synchroniser", action: () => syncOne(a.id),
       });
     }
     for (const a of outdatedAgents) {
@@ -157,7 +180,7 @@
   onMount(async () => {
     bundledVersion = await api.bundledAgentVersion();
     if (await api.getScanOnLaunch().catch(() => true)) {
-      await scan();
+      await scan("launch");
     } else {
       await load();
     }
@@ -169,7 +192,7 @@
   <span class="section-title">Aperçu</span>
   <div class="spacer"></div>
   {#if agents.length > 0}
-    <button class="toolbar-icon-btn" on:click={scan} disabled={scanning} aria-label="Rechercher et synchroniser">
+    <button class="toolbar-icon-btn" on:click={() => scan()} disabled={scanning} aria-label="Rechercher et synchroniser">
       <Icon name="refresh" />
     </button>
   {/if}
@@ -214,7 +237,7 @@
         {:else}Tout est synchronisé.{/if}
       </div>
     </div>
-    <button class="primary" on:click={scan} disabled={scanning}>{scanning ? "Recherche…" : "Tout synchroniser"}</button>
+    <button class="primary" on:click={() => scan()} disabled={scanning}>{scanning ? "Recherche…" : "Tout synchroniser"}</button>
   </div>
 
   <div class="stat-strip">

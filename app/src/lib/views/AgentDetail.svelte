@@ -6,6 +6,7 @@
   import UnblockDialog from "../UnblockDialog.svelte";
   import DiscoveredDomainsDialog from "../DiscoveredDomainsDialog.svelte";
   import { autofocus } from "../actions.js";
+  import { reportOutcome, syncState } from "../syncFeedback.js";
 
   export let agentId;
   export let refreshToken = 0;
@@ -139,7 +140,8 @@
     if (!agent?.last_ip) { error = "Adresse IP inconnue — lancez une recherche depuis l'Aperçu."; return; }
     busy = true; error = "";
     try {
-      await api.syncAgent(agentId, `${agent.last_ip}:7878`);
+      const outcome = await api.syncAgent(agentId, `${agent.last_ip}:7878`);
+      reportOutcome(outcome, sync);
       await load();
       dispatch("changed");
     } catch (e) { error = String(e); } finally { busy = false; }
@@ -236,6 +238,9 @@
     } catch (e) { error = String(e); }
   }
 
+  $: sync_ = syncState(agent);
+  $: hasRules = assignments.length > 0;
+
   $: isOutdated = bundledVersion && agent?.agent_version && agent.agent_version !== "unknown" && agent.agent_version !== bundledVersion;
 
   $: agentId, load();
@@ -303,6 +308,32 @@
       <div class="field"><div class="k">Politique</div><div class="v">v{agent.policy_version}</div></div>
       <div class="field"><div class="k">Version agent</div><div class="v">{agent.agent_version ?? "inconnue"}</div></div>
     </div>
+
+    {#if !agent.revoked}
+      <div class="sync-line {sync_.kind}" title={sync_.detail}>
+        {#if busy}
+          <span class="spinner"></span><span>Synchronisation en cours…</span>
+        {:else}
+          <Icon name={sync_.kind === "ok" ? "check" : sync_.kind === "never" ? "refresh" : "warning"} />
+          <span>{sync_.label}</span>
+          {#if sync_.detail}<span style="color:var(--text-dim);">· {sync_.detail}</span>{/if}
+          {#if sync_.kind === "failed" || sync_.kind === "pending" || sync_.kind === "never"}
+            <button class="link" on:click={sync}>Synchroniser maintenant</button>
+          {/if}
+        {/if}
+      </div>
+    {/if}
+
+    {#if !hasRules && !agent.revoked}
+      <div class="next-steps">
+        <strong>Prochaines étapes</strong>
+        <ol>
+          <li class:done={lists.length > 0}>Créer une liste de sites à bloquer{lists.length > 0 ? ` (${lists.length} disponible${lists.length > 1 ? "s" : ""})` : " — « Nouvelle liste » dans la barre latérale"}</li>
+          <li>L'affecter à ce poste, ci-dessous dans « Listes bloquées », ou via un groupe</li>
+          <li>C'est tout : les règles sont envoyées automatiquement au poste, un message confirme quand c'est fait</li>
+        </ol>
+      </div>
+    {/if}
 
     {#if isOutdated}
       <div class="row-line" style="background:var(--warn-weak); border-radius:var(--radius-md); border-top:none; margin-bottom:var(--space-4);">

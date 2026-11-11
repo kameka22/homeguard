@@ -137,7 +137,7 @@
       // Best-effort — closing the dialog matters more than a clean
       // server shutdown, which the app will also do on quit.
     }
-    dispatch("close");
+    dispatch("close", { enrolled: detected.map((d) => ({ agent_id: d.agent_id, name: d.name || d.hostname })) });
   }
 </script>
 

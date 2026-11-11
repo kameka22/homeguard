@@ -5,6 +5,7 @@ mod keychain_ca_store;
 mod menu;
 mod net;
 mod state;
+mod sync;
 
 use tauri::Manager;
 
@@ -20,6 +21,7 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let state = AppState::init(&data_dir)?;
+            state.auto_push.start(app.handle().clone());
             app.manage(state);
             Ok(())
         })
