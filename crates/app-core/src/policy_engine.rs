@@ -48,8 +48,11 @@ pub fn resolve_policy_for_agent(
     let exceptions = db
         .exceptions_for(agent_id, &group_ids)?
         .into_iter()
+        // Expanded exactly like the rules: an admin unblocking
+        // "youtube.com" means the site, so "www.youtube.com" and the
+        // catalog variants the rule blocked must be lifted too.
         .map(|e| PolicyException {
-            domains: e.domains,
+            domains: expand_domains(&e.domains, &catalog, auto_www),
             until: e.until,
         })
         .collect();
@@ -146,6 +149,21 @@ mod tests {
         let effective = policy.effective_domains_at(now).unwrap();
         assert!(effective.contains("tiktok.com"));
         assert!(!effective.contains("twitch.tv"));
+    }
+
+    #[test]
+    fn an_exception_lifts_every_variant_its_rule_blocked() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("a1", "PORTABLE-LEO", "windows", "x86_64", None, None).unwrap();
+        let video = db.create_list("Vidéo", &["youtube.com".to_string()]).unwrap();
+        db.create_assignment(&video, TargetKind::Agent, "a1", None).unwrap();
+        let until = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(1800);
+        db.create_exception(TargetKind::Agent, "a1", &["youtube.com".to_string()], until).unwrap();
+
+        let policy = resolve_policy_for_agent(&db, "a1", 1, "Europe/Paris", false, false, true).unwrap();
+        assert!(policy.rules[0].domains.len() > 2, "catalog variants expected for youtube.com");
+        let effective = policy.effective_domains_at(jiff::Timestamp::now()).unwrap();
+        assert!(effective.is_empty(), "still blocked during the exception: {effective:?}");
     }
 
     #[test]
