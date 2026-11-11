@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use homeguard_app_core::client::{connect_to_agent, AgentClient, ClientError};
+use homeguard_app_core::client::{connect_to_agent, AgentClient, ClientError, TlsFailure};
 use homeguard_app_core::policy_engine::{resolve_policy_for_agent, PolicyEngineError};
 use homeguard_common::wire::AgentStatus;
 use serde::Serialize;
@@ -98,34 +98,20 @@ pub fn classify(e: &ClientError) -> SyncFailure {
     let kind = match e {
         ClientError::AgentRevoked(_) => SyncErrorKind::Revoked,
         ClientError::UnexpectedStatus(_) => SyncErrorKind::Incompatible,
-        ClientError::Request(re) => {
-            let chain = error_chain(re).to_ascii_lowercase();
-            if re.is_timeout() {
-                SyncErrorKind::Timeout
-            } else if ["certificate", "handshake", "tls", "alert"].iter().any(|w| chain.contains(w)) {
-                SyncErrorKind::TlsRejected
-            } else if re.is_connect() {
-                SyncErrorKind::Unreachable
-            } else if re.is_decode() || re.is_body() {
-                SyncErrorKind::Incompatible
-            } else {
-                SyncErrorKind::Other
-            }
-        }
+        ClientError::Request(re) => match e.tls_failure() {
+            // Checked before `is_connect`: a rejected certificate surfaces
+            // either as a connect error (the app refused the agent's) or a
+            // send error (the agent refused the app's, via a TLS alert).
+            Some(TlsFailure::Rejected) => SyncErrorKind::TlsRejected,
+            Some(TlsFailure::NotTls) => SyncErrorKind::Incompatible,
+            None if re.is_timeout() => SyncErrorKind::Timeout,
+            None if re.is_connect() => SyncErrorKind::Unreachable,
+            None if re.is_decode() || re.is_body() => SyncErrorKind::Incompatible,
+            None => SyncErrorKind::Other,
+        },
         _ => SyncErrorKind::Other,
     };
     SyncFailure::new(kind, e)
-}
-
-fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
-    let mut out = e.to_string();
-    let mut source = e.source();
-    while let Some(s) = source {
-        out.push_str(" / ");
-        out.push_str(&s.to_string());
-        source = s.source();
-    }
-    out
 }
 
 #[derive(Debug, Clone, Serialize)]
